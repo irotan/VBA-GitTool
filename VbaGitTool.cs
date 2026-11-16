@@ -1,4 +1,4 @@
-// VBA Git 管理ツール 最終完成版 (ローカル管理特化カラーリング・実測サイズ完全レスポンシブ版)
+// VBA Git 管理ツール 最終完成版 (srcフォルダ自動隠し属性対応・ローカル管理特化版)
 // ビルド例 (C# 5 互換 / .NET Framework 4.x):
 //   csc /target:winexe /out:VbaGitTool.exe VbaGitTool.cs /r:System.Windows.Forms.dll /r:System.Drawing.dll
 
@@ -252,13 +252,17 @@ namespace VbaGitTool
     }
 
     // =========================================================================
-    // 退避（バックアップ）/ .gitignore 補助 / フォルダ自動補正
+    // 退避（バックアップ）/ .gitignore 補助 / フォルダ自動補正 / src隠し属性
     // =========================================================================
     public static class ProjectFiles
     {
         public static readonly string[] DefaultIgnoreLines = { "bin/*", "!bin/.gitkeep", "~$*" };
         private const int KeepBackups = 10;
 
+        /// <summary>
+        /// 指定フォルダ（カレント）と1階層上の親フォルダを確認し、
+        /// bin フォルダ内から起動された場合は1階層上の親フォルダへ自動補正する。
+        /// </summary>
         public static string ResolveProjectRoot(string dir, out bool adjusted)
         {
             adjusted = false;
@@ -276,12 +280,11 @@ namespace VbaGitTool
             string currentFolderName = Path.GetFileName(trimmed);
 
             bool parentHasGit = HasGitFolder(parentPath);
-            bool isSubFolderName = currentFolderName.Equals("bin", StringComparison.OrdinalIgnoreCase)
-                                || currentFolderName.Equals("src", StringComparison.OrdinalIgnoreCase);
+            bool isBinFolder = currentFolderName.Equals("bin", StringComparison.OrdinalIgnoreCase);
             bool parentHasMarkers = Directory.Exists(Path.Combine(parentPath, "bin"))
                                  || Directory.Exists(Path.Combine(parentPath, "src"));
 
-            if (parentHasGit || (isSubFolderName && parentHasMarkers))
+            if (isBinFolder && (parentHasGit || parentHasMarkers))
             {
                 adjusted = true;
                 return parentPath;
@@ -294,6 +297,36 @@ namespace VbaGitTool
         {
             string dotGit = Path.Combine(path, ".git");
             return Directory.Exists(dotGit) || File.Exists(dotGit);
+        }
+
+        /// <summary>
+        /// src フォルダの隠しファイル属性（Hidden）を設定・解除する。
+        /// ユーザーが直接編集しないよう普段は隠し属性を付与し、vbacやgitが書き換える直前に一時解除する。
+        /// </summary>
+        public static void SetSrcHidden(string projectDir, bool hidden)
+        {
+            try
+            {
+                string srcPath = Path.Combine(projectDir, "src");
+                if (!Directory.Exists(srcPath)) return;
+
+                var di = new DirectoryInfo(srcPath);
+                if (hidden)
+                {
+                    if ((di.Attributes & FileAttributes.Hidden) == 0)
+                    {
+                        di.Attributes |= FileAttributes.Hidden;
+                    }
+                }
+                else
+                {
+                    if ((di.Attributes & FileAttributes.Hidden) != 0)
+                    {
+                        di.Attributes &= ~FileAttributes.Hidden;
+                    }
+                }
+            }
+            catch { }
         }
 
         public static string BackupWorkingState(string dir, Action<string> log)
@@ -383,7 +416,7 @@ namespace VbaGitTool
         private readonly string _masterVbacPath;
         private readonly CommandRunner _cmd;
 
-        // カラー定義（ローカル操作のみを強調し、それ以外は標準の白背景・黒文字に統一）
+        // カラー定義
         private static readonly Color BgBlue  = Color.FromArgb(230, 242, 255);
         private static readonly Color FgBlue  = Color.FromArgb(0, 70, 160);
         private static readonly Color BgGreen = Color.FromArgb(215, 245, 225);
@@ -464,10 +497,6 @@ namespace VbaGitTool
             };
         }
 
-        /// <summary>
-        /// 指定した背景色・文字色・太字有無でボタンを生成する。
-        /// 無効化(Enabled=false)時にも指定した文字色（青・緑・黒）がグレーに潰れず視認できるよう描画を補助する。
-        /// </summary>
         private Button CreateStyledButton(string text, Color backColor, Color foreColor, bool bold)
         {
             var btn = new Button
@@ -483,7 +512,6 @@ namespace VbaGitTool
             btn.FlatAppearance.BorderColor = Color.FromArgb(200, 205, 210);
             btn.FlatAppearance.BorderSize = 1;
 
-            // Enabled=false のとき標準描画だと文字色が強制的に灰色になり指定色が見えなくなるため、無効時のみ指定色で文字を上書き描画
             btn.Paint += (s, e) =>
             {
                 var b = (Button)s;
@@ -513,7 +541,7 @@ namespace VbaGitTool
         }
 
         // ---------------------------------------------------------------------
-        // UI 構築 (AutoScaleMode.None で勝手な縮小・拡大を防止)
+        // UI 構築
         // ---------------------------------------------------------------------
         private void InitializeComponents()
         {
@@ -553,7 +581,6 @@ namespace VbaGitTool
             lblTag = new Label { Text = "タグ(任意):", AutoSize = true };
             txtTagName = new TextBox();
 
-            // ローカル保存のみ青＆太字、GitHub送信系は標準（白背景・黒文字・太字なし）
             btnSave = CreateStyledButton("Save (ローカル保存のみ)", BgBlue, FgBlue, true);
             btnSave.Click += async (s, e) => await RunOperationAsync(() => ExecuteSaveAsync(false));
 
@@ -569,21 +596,17 @@ namespace VbaGitTool
             grpRestore = new GroupBox { Text = "2. 取得・復元（やり直し） ※Excelを閉じてから実行" };
             lblHist = new Label { Text = "過去の履歴・タグ一覧（選択して復元 or タグ付け）:", AutoSize = true };
 
-            // ⑦「履歴再読込」ボタンを青にする
             btnRefreshHist = CreateStyledButton("履歴再読込", BgBlue, FgBlue, false);
             btnRefreshHist.Click += async (s, e) => await RunOperationAsync(() => RefreshHistoryListAsync());
 
             lstHistory = new ListBox { Font = new Font("Consolas", 9.5f), HorizontalScrollbar = true, IntegralHeight = false };
 
-            // 選択した履歴へ復元 (ローカル) は青＆太字
             btnRestoreLocal = CreateStyledButton("選択した履歴へ復元 (ローカル)", BgBlue, FgBlue, true);
             btnRestoreLocal.Click += async (s, e) => await RunOperationAsync(() => ExecuteRestoreSelectedAsync(false));
 
-            // ②「直前のSave状態へ戻す (ローカル)」にして、緑の塗りつぶしと文字色を緑にする
             btnRestoreLatest = CreateStyledButton("直前のSave状態へ戻す (ローカル)", BgGreen, FgGreen, false);
             btnRestoreLatest.Click += async (s, e) => await RunOperationAsync(() => ExecuteRestoreLatestAsync());
 
-            // ③ Pull含め下段のボタンはすべて標準（白背景・黒文字・太字なし）
             btnPull = CreateStyledButton("Pull (GitHub最新取得＋Excel反映)", BgWhite, FgBlack, false);
             btnPull.Click += async (s, e) => await RunOperationAsync(() => ExecutePullAsync());
 
@@ -604,7 +627,6 @@ namespace VbaGitTool
             btnCloneNew = CreateStyledButton("新規クローン (GitHubから)", BgWhite, FgBlack, false);
             btnCloneNew.Click += async (s, e) => await RunOperationAsync(() => ExecuteCloneNewAsync());
 
-            // ④ 初期設定ボタンの青の塗りつぶしをやめて、文字色も標準の黒（太字なし）にする
             btnInitProject = CreateStyledButton("初期設定 (.gitignore / 監視解除)", BgWhite, FgBlack, false);
             btnInitProject.Click += async (s, e) => await RunOperationAsync(() => OpenInitProjectDialogAsync());
 
@@ -612,7 +634,6 @@ namespace VbaGitTool
 
             // 4. 実行ログ
             lblLog = new Label { Text = "実行ログ:", AutoSize = true };
-            // ⑤ 右クリックメニュー登録ボタンの緑の塗りつぶしをやめて、文字色は標準の黒（太字なし）にする
             btnToggleReg = CreateStyledButton("右クリックメニュー登録済み (解除する)", BgWhite, FgBlack, false);
             btnToggleReg.Click += (s, e) => ToggleContextMenuRegistration();
 
@@ -630,9 +651,6 @@ namespace VbaGitTool
             ApplyResponsiveLayout();
         }
 
-        /// <summary>
-        /// ウィンドウサイズと実測文字サイズに基づき、すべてのコントロールを重なり・欠け無しで配置する。
-        /// </summary>
         private void ApplyResponsiveLayout()
         {
             if (pnlTop == null || this.ClientSize.Width < 200 || this.ClientSize.Height < 200) return;
@@ -698,7 +716,7 @@ namespace VbaGitTool
             int setupBtnY = fh + 8;
             int grp3H = setupBtnY + btnH + 12;
 
-            // 4. 残り高さを Group 2 (Restore) と Log に配分 (58% : 42%)
+            // 4. 残り高さを Group 2 (Restore) と Log に配分
             int logHeaderH = smallBtnH + 6;
             int usedFixedH = grp1Y + grp1H + 8 + grp3H + 8 + logHeaderH + pad;
             int availFlexH = Math.Max(220, ch - usedFixedH);
@@ -722,7 +740,7 @@ namespace VbaGitTool
             btnRestoreLocal.Bounds = new Rectangle(innerPad, rMidRowY, w2_1, btnH);
             btnRestoreLatest.Bounds = new Rectangle(btnRestoreLocal.Right + gap, rMidRowY, w2_2, btnH);
 
-            // 下段：3ボタン (37% : 37% : 26% で配分)
+            // 下段：3ボタン
             int subAvailW = innerW - gap * 2;
             int ws1 = (int)(subAvailW * 0.37);
             int ws2 = (int)(subAvailW * 0.37);
@@ -822,7 +840,7 @@ namespace VbaGitTool
             {
                 if (_initialDirAdjusted)
                 {
-                    AppendLog("[案内] サブフォルダ(bin/src等)から起動されたため、1階層上の親フォルダへ自動補正しました: " + _targetDir);
+                    AppendLog("[案内] binフォルダから起動されたため、1階層上の親フォルダへ自動補正しました: " + _targetDir);
                 }
 
                 var r = await _cmd.RunAsync("git", "--version", _appDir, true);
@@ -854,6 +872,9 @@ namespace VbaGitTool
                 _targetDir = resolved;
                 AppendLog("[案内] 親フォルダ（開発用フォルダ）を検出したため、対象フォルダを自動補正しました: " + _targetDir);
             }
+
+            // 既存の src フォルダがあれば自動的に隠し属性を付与して保護する
+            ProjectFiles.SetSrcHidden(_targetDir, true);
 
             lblTargetDir.Text = "対象フォルダ: " + _targetDir;
             UpdateRegButtonText();
@@ -940,7 +961,7 @@ namespace VbaGitTool
                     txtLog.Clear();
                     if (adjusted)
                     {
-                        AppendLog("[案内] サブフォルダが選択されたため、1階層上の親フォルダへ自動補正しました: " + _targetDir);
+                        AppendLog("[案内] binフォルダが選択されたため、1階層上の親フォルダへ自動補正しました: " + _targetDir);
                     }
                     var ignored = RunOperationAsync(() => Task.FromResult(0));
                 }
@@ -948,7 +969,7 @@ namespace VbaGitTool
         }
 
         // ---------------------------------------------------------------------
-        // 安全装置 / vbac
+        // 安全装置 / vbac (実行前後に src の隠し属性を自動制御)
         // ---------------------------------------------------------------------
         private bool IsExcelOpenInBin(string dir)
         {
@@ -980,6 +1001,9 @@ namespace VbaGitTool
             string binDir = Path.Combine(dir, "bin");
             if (!Directory.Exists(binDir)) Directory.CreateDirectory(binDir);
 
+            // vbac.wsf が src フォルダへアクセスできるよう一時的に隠し属性を解除
+            ProjectFiles.SetSrcHidden(dir, false);
+
             string tempVbac = Path.Combine(dir, "vbac.wsf");
             bool copiedTemp = false;
             try
@@ -1000,6 +1024,8 @@ namespace VbaGitTool
                 {
                     try { File.Delete(tempVbac); } catch { }
                 }
+                // 処理完了後、ユーザーが誤って触らないよう src フォルダを再び隠しフォルダにする
+                ProjectFiles.SetSrcHidden(dir, true);
             }
         }
 
@@ -1119,7 +1145,7 @@ namespace VbaGitTool
             }
             else
             {
-                AppendLog("完了: ローカル Git へのセーブが完了しました！");
+                AppendLog("完了: ローカル Git へのセーブが完了しました！（srcフォルダは隠し属性で保護されています）");
             }
         }
 
@@ -1151,7 +1177,10 @@ namespace VbaGitTool
             if (!await BackupBeforeOverwriteAsync(dir)) return;
 
             AppendLog("========== GitHub から最新取得 (Pull) ==========");
+            ProjectFiles.SetSrcHidden(dir, false);
             var pullRes = await _cmd.GitAsync(dir, false, "pull", "origin", _branch);
+            ProjectFiles.SetSrcHidden(dir, true);
+
             if (!pullRes.Success)
             {
                 AppendLog("[エラー] git pull に失敗しました。ローカルに未保存の変更があるか、リモート/認証に問題があります。");
@@ -1176,18 +1205,26 @@ namespace VbaGitTool
                 return false;
             }
 
-            await _cmd.GitAsync(dir, true, "rm", "-r", "-f", "-q", "--ignore-unmatch", "--", "src");
-            await _cmd.GitAsync(dir, true, "clean", "-f", "-d", "-q", "--", "src");
-
-            var co = await _cmd.GitAsync(dir, false, "checkout", rev, "--", "src");
-            if (!co.Success)
+            ProjectFiles.SetSrcHidden(dir, false);
+            try
             {
-                AppendLog("[エラー] src/ の復元に失敗しました。HEAD からの復旧を試みます...");
-                await _cmd.GitAsync(dir, false, "checkout", "HEAD", "--", "src");
-                AppendLog("  退避フォルダ (.git\\vbagit_backup) に元の状態が残っています。");
-                return false;
+                await _cmd.GitAsync(dir, true, "rm", "-r", "-f", "-q", "--ignore-unmatch", "--", "src");
+                await _cmd.GitAsync(dir, true, "clean", "-f", "-d", "-q", "--", "src");
+
+                var co = await _cmd.GitAsync(dir, false, "checkout", rev, "--", "src");
+                if (!co.Success)
+                {
+                    AppendLog("[エラー] src/ の復元に失敗しました。HEAD からの復旧を試みます...");
+                    await _cmd.GitAsync(dir, false, "checkout", "HEAD", "--", "src");
+                    AppendLog("  退避フォルダ (.git\\vbagit_backup) に元の状態が残っています。");
+                    return false;
+                }
+                return true;
             }
-            return true;
+            finally
+            {
+                ProjectFiles.SetSrcHidden(dir, true);
+            }
         }
 
         private async Task ExecuteRestoreLatestAsync()
@@ -1391,6 +1428,9 @@ namespace VbaGitTool
             string binPath = Path.Combine(newProjectPath, "bin");
             if (!Directory.Exists(binPath)) Directory.CreateDirectory(binPath);
 
+            // クローン直後の src フォルダにも隠し属性を付与
+            ProjectFiles.SetSrcHidden(newProjectPath, true);
+
             AppendLog("完了: クローンが完了しました！作業対象を新しいフォルダへ切り替えます。");
             _targetDir = newProjectPath;
         }
@@ -1579,7 +1619,7 @@ namespace VbaGitTool
         }
 
         // ---------------------------------------------------------------------
-        // 右クリックメニュー (⑤ 常に塗りつぶしなし・黒文字・標準フォントを維持)
+        // 右クリックメニュー
         // ---------------------------------------------------------------------
         private void UpdateRegButtonText()
         {
@@ -1737,15 +1777,13 @@ namespace VbaGitTool
             return
                 "【日々のコーディング時の基本ステップ】\r\n\r\n" +
                 "1. binフォルダ内のExcelでマクロを編集し、上書き保存（Ctrl + S）する\r\n\r\n" +
-                "2. フォルダ内を右クリック ＞「VBA Git 管理ツールを開く」\r\n" +
-                "   （※うっかり bin や src フォルダ内で起動しても、自動で親フォルダへ補正されます）\r\n\r\n" +
+                "2. 親フォルダ（または bin フォルダ内）を右クリック ＞「VBA Git 管理ツールを開く」\r\n\r\n" +
                 "3.「コミットメモ」に修正内容を入力する\r\n" +
                 "   （空欄のままでも自動で日時メモが入ります）\r\n\r\n" +
                 "4. タイミングに合わせてボタンを押す\r\n" +
                 "   ・PC内だけ（ローカル）に保存 → [Save (ローカル保存のみ)]\r\n" +
                 "   ・GitHubにも送る（バックアップ） → [Save ＆ GitHub送信 (一括)]\r\n\r\n" +
-                "※.gitignore に bin/ の除外設定が無い場合は、Save時に警告が表示されます。\r\n" +
-                "※処理中はボタンが一時的に操作できなくなります（フォルダ変更・終了も不可）。\r\n\r\n" +
+                "※抽出されたVBAコードを格納する src フォルダは、誤編集防止のため自動的に「隠しフォルダ」として保護されます。\r\n\r\n" +
                 "------------------------------------------------------------\r\n" +
                 "【別のPCで作業を引き継ぐ時（GitHub利用時）】\r\n\r\n" +
                 "1. 必ずExcelブックを閉じた状態にする\r\n" +
@@ -1810,8 +1848,8 @@ namespace VbaGitTool
                 "  GitHub上の最新変更や過去履歴を取得してExcelへ反映します。\r\n\r\n" +
                 "・選択履歴にタグ付与\r\n" +
                 "  完成版や配布版など、重要な節目の履歴に「v1.0」等の目印（タグ）を付けます。\r\n\r\n" +
-                "・親フォルダ自動補正（スマート判定）\r\n" +
-                "  誤って bin や src フォルダ内で起動しても、1階層上の親フォルダを自動認識します。\r\n\r\n" +
+                "・親フォルダ自動補正 ＆ srcフォルダ隠し属性保護\r\n" +
+                "  bin フォルダ内で起動しても1階層上の親フォルダを自動認識し、src フォルダは隠し属性で保護します。\r\n\r\n" +
                 "・Excel使用中警告 ＆ 自動退避（安全装置）\r\n" +
                 "  Excelが開いたままの復元を防止し、実行直前に .git\\vbagit_backup へ自動バックアップします。";
         }
