@@ -54,10 +54,9 @@ namespace VbaGitTool
         private Button btnRestoreLocal;
         private Button btnRestoreGithub;
         private Button btnAddTag;
-        private Button btnInitLocalNew; // NEW
+        private Button btnInitLocalNew;
         private Button btnCloneNew;
         private Button btnInitProject;
-        private Button btnPushTemplate;
         private Button btnToggleReg;
         private Button btnChangeDir;
         private Button btnHelp;
@@ -81,8 +80,8 @@ namespace VbaGitTool
         private void InitializeComponents()
         {
             this.Text = "VBA Git 管理ツール";
-            this.Size = new Size(820, 780); // 高さを拡張
-            this.MinimumSize = new Size(780, 720);
+            this.Size = new Size(820, 740); // 1段になったので高さをコンパクトに戻す
+            this.MinimumSize = new Size(780, 680);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.Font = new Font("Yu Gothic UI", 9.5f, FontStyle.Regular);
 
@@ -142,31 +141,28 @@ namespace VbaGitTool
 
             grpRestore.Controls.AddRange(new Control[] { btnPull, btnRestoreLatest, lblHist, btnRefreshHist, lstHistory, btnRestoreLocal, btnRestoreGithub, btnAddTag });
 
-            // Group 3: Setup & Maintenance (2段に拡張)
-            GroupBox grpSetup = new GroupBox { Text = "3. 新規構築・初期設定・メンテナンス", Location = new Point(12, 420), Size = new Size(780, 105) };
+            // Group 3: Setup & Maintenance (横一列に変更)
+            GroupBox grpSetup = new GroupBox { Text = "3. 新規構築・初期設定・メンテナンス", Location = new Point(12, 420), Size = new Size(780, 68) };
             
-            btnInitLocalNew = new Button { Text = "新規作成 (ローカル専用)", Location = new Point(14, 24), Size = new Size(370, 34), BackColor = Color.White };
+            btnInitLocalNew = new Button { Text = "新規作成 (ローカル専用)", Location = new Point(14, 24), Size = new Size(245, 34), BackColor = Color.White };
             btnInitLocalNew.Click += async (s, e) => await ExecuteInitLocalNewAsync();
 
-            btnCloneNew = new Button { Text = "新規クローン (GitHubから)", Location = new Point(396, 24), Size = new Size(369, 34), BackColor = Color.White };
+            btnCloneNew = new Button { Text = "新規クローン (GitHubから)", Location = new Point(269, 24), Size = new Size(245, 34), BackColor = Color.White };
             btnCloneNew.Click += async (s, e) => await ExecuteCloneNewAsync();
 
-            btnInitProject = new Button { Text = "初期設定 (.gitignore / 監視解除)", Location = new Point(14, 62), Size = new Size(370, 34), BackColor = Color.White };
+            btnInitProject = new Button { Text = "初期設定 (.gitignore / 監視解除)", Location = new Point(524, 24), Size = new Size(241, 34), BackColor = Color.FromArgb(245, 250, 255), Font = new Font("Yu Gothic UI", 9.5f, FontStyle.Bold) };
             btnInitProject.Click += async (s, e) => await OpenInitProjectDialogAsync();
 
-            btnPushTemplate = new Button { Text = "テンプレート更新 (VBA_Template専用)", Location = new Point(396, 62), Size = new Size(369, 34), BackColor = Color.FromArgb(245, 235, 255) };
-            btnPushTemplate.Click += async (s, e) => await ExecutePushTemplateAsync();
+            grpSetup.Controls.AddRange(new Control[] { btnInitLocalNew, btnCloneNew, btnInitProject });
 
-            grpSetup.Controls.AddRange(new Control[] { btnInitLocalNew, btnCloneNew, btnInitProject, btnPushTemplate });
-
-            // Log Area (Y座標を全体的に下へシフト)
-            Label lblLog = new Label { Text = "実行ログ:", Location = new Point(14, 536), Size = new Size(100, 20) };
-            btnToggleReg = new Button { Text = "右クリックメニュー登録 / 解除", Location = new Point(570, 532), Size = new Size(222, 26), BackColor = Color.White };
+            // Log Area (元の高さに合わせてY座標を調整)
+            Label lblLog = new Label { Text = "実行ログ:", Location = new Point(14, 496), Size = new Size(100, 20) };
+            btnToggleReg = new Button { Text = "右クリックメニュー登録 / 解除", Location = new Point(570, 492), Size = new Size(222, 26), BackColor = Color.White };
             btnToggleReg.Click += (s, e) => ToggleContextMenuRegistration();
 
             txtLog = new TextBox
             {
-                Location = new Point(12, 560),
+                Location = new Point(12, 520),
                 Size = new Size(780, 170),
                 Multiline = true,
                 ReadOnly = true,
@@ -207,7 +203,7 @@ namespace VbaGitTool
             if (!isGitRepo)
             {
                 lblGitInfo.Text = "状態: Git未初期化フォルダ（親フォルダとして「新規作成」「クローン」が可能です）";
-                SetProjectButtonsEnabled(false, false);
+                SetProjectButtonsEnabled(false);
                 lstHistory.Items.Clear();
                 return;
             }
@@ -218,28 +214,25 @@ namespace VbaGitTool
 
             lblGitInfo.Text = string.Format("ブランチ: {0}   |   接続先(origin): {1}", branch, remoteUrl);
 
-            bool isTemplateRepo = remoteUrl.IndexOf("VBA_Template", StringComparison.OrdinalIgnoreCase) >= 0;
-            SetProjectButtonsEnabled(true, isTemplateRepo);
+            SetProjectButtonsEnabled(true);
 
             await RefreshHistoryListAsync();
         }
 
-        private void SetProjectButtonsEnabled(bool isGitRepo, bool isTemplateRepo)
+        private void SetProjectButtonsEnabled(bool isGitRepo)
         {
-            // プロジェクト内部で誤って新規構築しないよう、Git未初期化フォルダでのみ新規作成ボタンを有効化
             btnInitLocalNew.Enabled = !isGitRepo;
             btnCloneNew.Enabled = !isGitRepo;
             
-            btnSave.Enabled = isGitRepo && !isTemplateRepo;
-            btnSaveAndPush.Enabled = isGitRepo && !isTemplateRepo;
+            btnSave.Enabled = isGitRepo;
+            btnSaveAndPush.Enabled = isGitRepo;
             btnPushOnly.Enabled = isGitRepo;
-            btnPull.Enabled = isGitRepo && !isTemplateRepo;
-            btnRestoreLatest.Enabled = isGitRepo && !isTemplateRepo;
-            btnRestoreLocal.Enabled = isGitRepo && !isTemplateRepo;
-            btnRestoreGithub.Enabled = isGitRepo && !isTemplateRepo;
+            btnPull.Enabled = isGitRepo;
+            btnRestoreLatest.Enabled = isGitRepo;
+            btnRestoreLocal.Enabled = isGitRepo;
+            btnRestoreGithub.Enabled = isGitRepo;
             btnAddTag.Enabled = isGitRepo;
-            btnInitProject.Enabled = isGitRepo && !isTemplateRepo;
-            btnPushTemplate.Enabled = isGitRepo && isTemplateRepo;
+            btnInitProject.Enabled = isGitRepo;
         }
 
         private void ChangeTargetDirectory()
@@ -525,7 +518,7 @@ namespace VbaGitTool
         }
 
         // =====================================================================
-        // NEW: ローカル専用での新規作成（git init）
+        // ローカル専用での新規作成（git init）
         // =====================================================================
         private async Task ExecuteInitLocalNewAsync()
         {
@@ -715,31 +708,6 @@ namespace VbaGitTool
                 {
                     LoadDirectoryContext();
                 }
-            }
-        }
-
-        private async Task ExecutePushTemplateAsync()
-        {
-            string msg = txtCommitMsg.Text.Trim();
-            if (string.IsNullOrEmpty(msg)) msg = "マスターテンプレート更新 (" + DateTime.Now.ToString("yyyy/MM/dd HH:mm") + ")";
-
-            SetAllButtonsEnabled(false);
-            try
-            {
-                AppendLog("========== マスターテンプレート (VBA_Template) 更新 ==========");
-                await RunCommandAsync("git", "add -A", _targetDir, false);
-                await RunCommandAsync("git", string.Format("commit -m \"{0}\"", msg.Replace("\"", "'")), _targetDir, false);
-                var pushRes = await RunCommandAsync("git", "push -u origin main", _targetDir, false);
-                if (pushRes.ExitCode == 0)
-                {
-                    txtCommitMsg.Clear();
-                    AppendLog("完了: GitHub上の VBA_Template を最新版に更新しました！");
-                }
-                await RefreshHistoryListAsync();
-            }
-            finally
-            {
-                LoadDirectoryContext();
             }
         }
 
@@ -1000,7 +968,7 @@ namespace VbaGitTool
                 "  1. 案件のフォルダを作りたい「親フォルダ」で右クリックして本ツールを開く\r\n" +
                 "  2. [新規作成 (ローカル専用)] を押し、フォルダ名を入力する\r\n" +
                 "  3. 新しいフォルダが作成され、自動的に切り替わります\r\n" +
-                "  4. [初期設定 (.gitignore)] を押し、[標準除外セット]を追加して確定します\r\n" +
+                "  4. [プロジェクト初期設定] を押し、[標準除外セット]を追加して確定します\r\n" +
                 "  5. binフォルダにExcelファイルを入れ、[Save] を押せば初期登録完了です！\r\n\r\n" +
                 "■ パターンB：GitHubを利用してバックアップや共有を行う場合\r\n" +
                 "  1. GitHub上で新しい空のリポジトリを作成し、URLをコピーします\r\n" +
@@ -1038,11 +1006,8 @@ namespace VbaGitTool
                 "  上記のSaveに加え、GitHubへバックアップ送信（Push）まで一気に行います。\r\n\r\n" +
                 "・GitHub送信のみ (Push)\r\n" +
                 "  ローカルにSave済みの履歴や、後から付けたタグをGitHubへ送信します。\r\n\r\n" +
-                "・新規作成 / 新規クローン / 初期設定\r\n" +
+                "・新規作成 / 新規クローン / プロジェクト初期設定\r\n" +
                 "  空のプロジェクト作成、URLからの環境複製、除外ファイル設定を行います。\r\n\r\n" +
-                "・テンプレート更新 (VBA_Template専用)\r\n" +
-                "  誤操作防止のため、接続先が「VBA_Template」のフォルダを開いている時のみ\r\n" +
-                "  有効化され、それ以外のプロジェクトでは自動的にロックされます。\r\n\r\n" +
                 "・Excel使用中警告（安全装置）\r\n" +
                 "  Pullや復元時にbin内にロックファイル（~$*.xlsm）がある場合は処理を中断します。";
         }

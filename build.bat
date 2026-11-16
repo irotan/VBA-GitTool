@@ -2,7 +2,7 @@
 pushd "%~dp0"
 
 echo ========================================================
-echo  VbaGitTool.exe ã‚’ãƒ“ãƒ«ãƒ‰ï¼ˆã‚³ãƒ³ãƒ‘ã‚¤ãƒ«ï¼‰ã—ã¾ã™...
+echo  VbaGitTool.exe ‚ðƒrƒ‹ƒhiƒRƒ“ƒpƒCƒ‹j‚µ‚Ü‚·...
 echo ========================================================
 echo.
 
@@ -12,17 +12,17 @@ if not exist "%CSC_PATH%" (
 )
 
 if not exist "%CSC_PATH%" (
-    echo [ã‚¨ãƒ©ãƒ¼] Windowsæ¨™æº–ã® C# ã‚³ãƒ³ãƒ‘ã‚¤ãƒ©ï¼ˆcsc.exeï¼‰ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã§ã—ãŸã€‚
+    echo [ƒGƒ‰[] Windows•W€‚Ì C# ƒRƒ“ƒpƒCƒ‰icsc.exej‚ªŒ©‚Â‚©‚è‚Ü‚¹‚ñ‚Å‚µ‚½B
     popd
     pause
     exit /b 1
 )
 
-:: èª­ã¿è¾¼ã‚€ãƒ•ã‚¡ã‚¤ãƒ«ã‚’ VbaGitTool.cs ã«å¤‰æ›´
+:: “Ç‚Ýž‚Þƒtƒ@ƒCƒ‹‚ð VbaGitTool.cs ‚É•ÏX
 "%CSC_PATH%" /target:winexe /out:VbaGitTool.exe /utf8output VbaGitTool.cs
 if %errorlevel% neq 0 (
     echo.
-    echo [ã‚¨ãƒ©ãƒ¼] ã‚³ãƒ³ãƒ‘ã‚¤ãƒ«ã«å¤±æ•—ã—ã¾ã—ãŸã€‚ä¸Šè¨˜ã®ã‚¨ãƒ©ãƒ¼ãƒ¡ãƒƒã‚»ãƒ¼ã‚¸ã‚’ç¢ºèªã—ã¦ãã ã•ã„ã€‚
+    echo [ƒGƒ‰[] ƒRƒ“ƒpƒCƒ‹‚ÉŽ¸”s‚µ‚Ü‚µ‚½Bã‹L‚ÌƒGƒ‰[ƒƒbƒZ[ƒW‚ðŠm”F‚µ‚Ä‚­‚¾‚³‚¢B
     popd
     pause
     exit /b 1
@@ -30,7 +30,7 @@ if %errorlevel% neq 0 (
 
 echo.
 echo ========================================================
-echo  æˆåŠŸï¼ VbaGitTool.exe ãŒç”Ÿæˆã•ã‚Œã¾ã—ãŸï¼
+echo  ¬Œ÷I VbaGitTool.exe ‚ª¶¬‚³‚ê‚Ü‚µ‚½I
 echo ========================================================
 echo.
 popd
