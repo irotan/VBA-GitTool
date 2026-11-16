@@ -1,14 +1,6 @@
-// VBA Git 管理ツール 修正版
+// VBA Git 管理ツール 最終完成版 (ローカル管理特化カラーリング・実測サイズ完全レスポンシブ版)
 // ビルド例 (C# 5 互換 / .NET Framework 4.x):
-//   csc /target:winexe /out:VbaGitTool.exe Program.cs /r:System.Windows.Forms.dll /r:System.Drawing.dll
-//
-// 修正内容:
-//  1. 復元時: 実行前に src/bin を .git\vbagit_backup\ へ自動退避 / 削除済みファイルが残らないよう src を置換
-//  2. ブランチ名を動的取得（main 固定を廃止、detached HEAD / リモート無しを検知）
-//  3. 引数エスケープ(Quote)・タグ名検証(check-ref-format)・フォルダ名/URL/ハッシュ検証
-//  4. git 未インストール・実行例外・未処理例外のハンドリング
-//  5. 処理中は操作ロック（フォルダ変更・終了も防止）
-//  6. .gitignore 未設定時の Save 警告 / クラス分割 / DPI 対応
+//   csc /target:winexe /out:VbaGitTool.exe VbaGitTool.cs /r:System.Windows.Forms.dll /r:System.Drawing.dll
 
 using System;
 using System.Collections.Generic;
@@ -75,7 +67,6 @@ namespace VbaGitTool
             _log = log;
         }
 
-        /// <summary>CommandLineToArgvW 規則に従って 1 引数をクォートする。</summary>
         public static string Quote(string arg)
         {
             if (arg == null) arg = "";
@@ -112,7 +103,6 @@ namespace VbaGitTool
             return string.Join(" ", args.Select(a => Quote(a)).ToArray());
         }
 
-        /// <summary>git を実行（引数は個別に渡す。自動でクォートされる）。</summary>
         public Task<CmdResult> GitAsync(string workDir, bool silent, params string[] args)
         {
             var all = new List<string> { "-c", "core.quotepath=false" };
@@ -139,7 +129,6 @@ namespace VbaGitTool
                     StandardOutputEncoding = enc,
                     StandardErrorEncoding = enc
                 };
-                // 非表示ウィンドウで資格情報入力待ちのまま固まるのを防ぐ
                 psi.EnvironmentVariables["GIT_TERMINAL_PROMPT"] = "0";
 
                 var sbOut = new StringBuilder();
@@ -208,7 +197,7 @@ namespace VbaGitTool
         {
             if (string.IsNullOrWhiteSpace(url)) return false;
             url = url.Trim();
-            if (url.StartsWith("-")) return false;          // オプション注入防止
+            if (url.StartsWith("-")) return false;
             if (url.Any(c => char.IsWhiteSpace(c) || char.IsControl(c))) return false;
             return true;
         }
@@ -263,17 +252,50 @@ namespace VbaGitTool
     }
 
     // =========================================================================
-    // 退避（バックアップ）/ .gitignore 補助
+    // 退避（バックアップ）/ .gitignore 補助 / フォルダ自動補正
     // =========================================================================
     public static class ProjectFiles
     {
         public static readonly string[] DefaultIgnoreLines = { "bin/*", "!bin/.gitkeep", "~$*" };
         private const int KeepBackups = 10;
 
-        /// <summary>
-        /// src と bin を .git\vbagit_backup\yyyyMMdd_HHmmss へコピー。
-        /// 戻り値: 退避先パス / 退避対象なしなら "" / 失敗なら null
-        /// </summary>
+        public static string ResolveProjectRoot(string dir, out bool adjusted)
+        {
+            adjusted = false;
+            if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir)) return dir;
+
+            string trimmed = dir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+            if (HasGitFolder(trimmed)) return trimmed;
+
+            DirectoryInfo parentInfo = null;
+            try { parentInfo = Directory.GetParent(trimmed); } catch { }
+            if (parentInfo == null || !parentInfo.Exists) return trimmed;
+
+            string parentPath = parentInfo.FullName;
+            string currentFolderName = Path.GetFileName(trimmed);
+
+            bool parentHasGit = HasGitFolder(parentPath);
+            bool isSubFolderName = currentFolderName.Equals("bin", StringComparison.OrdinalIgnoreCase)
+                                || currentFolderName.Equals("src", StringComparison.OrdinalIgnoreCase);
+            bool parentHasMarkers = Directory.Exists(Path.Combine(parentPath, "bin"))
+                                 || Directory.Exists(Path.Combine(parentPath, "src"));
+
+            if (parentHasGit || (isSubFolderName && parentHasMarkers))
+            {
+                adjusted = true;
+                return parentPath;
+            }
+
+            return trimmed;
+        }
+
+        private static bool HasGitFolder(string path)
+        {
+            string dotGit = Path.Combine(path, ".git");
+            return Directory.Exists(dotGit) || File.Exists(dotGit);
+        }
+
         public static string BackupWorkingState(string dir, Action<string> log)
         {
             try
@@ -293,7 +315,6 @@ namespace VbaGitTool
                 if (Directory.Exists(src)) CopyDirectory(src, Path.Combine(dest, "src"));
                 if (Directory.Exists(bin)) CopyDirectory(bin, Path.Combine(dest, "bin"));
 
-                // 古い退避を削除
                 foreach (string old in Directory.GetDirectories(root).OrderByDescending(d => d).Skip(KeepBackups))
                 {
                     try { Directory.Delete(old, true); } catch { }
@@ -322,7 +343,6 @@ namespace VbaGitTool
             }
         }
 
-        /// <summary>.gitignore に標準行を（足りない分だけ）追加し、bin/.gitkeep を作る。BOMなしUTF-8。</summary>
         public static void EnsureDefaultGitignore(string dir)
         {
             string path = Path.Combine(dir, ".gitignore");
@@ -353,24 +373,38 @@ namespace VbaGitTool
     }
 
     // =========================================================================
-    // メインフォーム
+    // メインフォーム (ローカル管理特化カラーリング ＋ 実測フォント基準レスポンシブ設計)
     // =========================================================================
     public class MainForm : Form
     {
         private string _targetDir;
+        private readonly bool _initialDirAdjusted;
         private readonly string _appDir;
         private readonly string _masterVbacPath;
         private readonly CommandRunner _cmd;
 
+        // カラー定義（ローカル操作のみを強調し、それ以外は標準の白背景・黒文字に統一）
+        private static readonly Color BgBlue  = Color.FromArgb(230, 242, 255);
+        private static readonly Color FgBlue  = Color.FromArgb(0, 70, 160);
+        private static readonly Color BgGreen = Color.FromArgb(215, 245, 225);
+        private static readonly Color FgGreen = Color.FromArgb(20, 100, 40);
+        private static readonly Color BgWhite = Color.White;
+        private static readonly Color FgBlack = Color.Black;
+
         // 状態
         private bool _busy;
         private bool _gitAvailable = true;
-        private string _branch;       // null = detached HEAD / 不明
+        private string _branch;
         private bool _hasRemote;
 
         // UI
+        private Panel pnlTop;
         private Label lblTargetDir;
         private Label lblGitInfo;
+        private Label lblMsg;
+        private Label lblTag;
+        private Label lblHist;
+        private Label lblLog;
         private TextBox txtCommitMsg;
         private TextBox txtTagName;
         private Button btnSave;
@@ -382,6 +416,7 @@ namespace VbaGitTool
         private Button btnRestoreLocal;
         private Button btnRestoreGithub;
         private Button btnAddTag;
+        private Button btnRefreshHist;
         private Button btnInitLocalNew;
         private Button btnCloneNew;
         private Button btnInitProject;
@@ -403,13 +438,21 @@ namespace VbaGitTool
 
         public MainForm(string initialDir)
         {
-            _targetDir = initialDir;
+            bool adjusted;
+            _targetDir = ProjectFiles.ResolveProjectRoot(initialDir, out adjusted);
+            _initialDirAdjusted = adjusted;
+
             _appDir = AppDomain.CurrentDomain.BaseDirectory;
             _masterVbacPath = Path.Combine(_appDir, "vbac.wsf");
             _cmd = new CommandRunner(AppendLog);
 
             InitializeComponents();
-            this.Shown += async (s, e) => await InitialLoadAsync();
+            this.Layout += (s, e) => ApplyResponsiveLayout();
+            this.Shown += async (s, e) =>
+            {
+                ApplyResponsiveLayout();
+                await InitialLoadAsync();
+            };
             this.FormClosing += (s, e) =>
             {
                 if (_busy)
@@ -421,110 +464,294 @@ namespace VbaGitTool
             };
         }
 
+        /// <summary>
+        /// 指定した背景色・文字色・太字有無でボタンを生成する。
+        /// 無効化(Enabled=false)時にも指定した文字色（青・緑・黒）がグレーに潰れず視認できるよう描画を補助する。
+        /// </summary>
+        private Button CreateStyledButton(string text, Color backColor, Color foreColor, bool bold)
+        {
+            var btn = new Button
+            {
+                Text = text,
+                BackColor = backColor,
+                ForeColor = foreColor,
+                UseVisualStyleBackColor = false,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Yu Gothic UI", 9.5f, bold ? FontStyle.Bold : FontStyle.Regular),
+                AutoEllipsis = false
+            };
+            btn.FlatAppearance.BorderColor = Color.FromArgb(200, 205, 210);
+            btn.FlatAppearance.BorderSize = 1;
+
+            // Enabled=false のとき標準描画だと文字色が強制的に灰色になり指定色が見えなくなるため、無効時のみ指定色で文字を上書き描画
+            btn.Paint += (s, e) =>
+            {
+                var b = (Button)s;
+                if (!b.Enabled)
+                {
+                    var rect = new Rectangle(1, 1, b.Width - 2, b.Height - 2);
+                    using (var brush = new SolidBrush(b.BackColor))
+                    {
+                        e.Graphics.FillRectangle(brush, rect);
+                    }
+                    TextRenderer.DrawText(
+                        e.Graphics,
+                        b.Text,
+                        b.Font,
+                        rect,
+                        b.ForeColor,
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+                }
+            };
+            return btn;
+        }
+
+        private static int MeasureButtonWidth(Control btn, int extraPadding)
+        {
+            Size sz = TextRenderer.MeasureText(btn.Text, btn.Font);
+            return sz.Width + extraPadding;
+        }
+
         // ---------------------------------------------------------------------
-        // UI 構築
+        // UI 構築 (AutoScaleMode.None で勝手な縮小・拡大を防止)
         // ---------------------------------------------------------------------
         private void InitializeComponents()
         {
-            this.AutoScaleDimensions = new SizeF(96F, 96F);
-            this.AutoScaleMode = AutoScaleMode.Dpi;
-
-            this.Text = "VBA Git 管理ツール";
-            this.Size = new Size(820, 740);
-            this.MinimumSize = new Size(780, 680);
-            this.StartPosition = FormStartPosition.CenterScreen;
+            this.AutoScaleMode = AutoScaleMode.None;
             this.Font = new Font("Yu Gothic UI", 9.5f, FontStyle.Regular);
 
-            Panel pnlTop = new Panel { Dock = DockStyle.Top, Height = 68, BackColor = Color.FromArgb(240, 244, 248), Padding = new Padding(10) };
-            lblTargetDir = new Label { Location = new Point(12, 10), Size = new Size(530, 22), Font = new Font("Yu Gothic UI", 9.5f, FontStyle.Bold), AutoEllipsis = true, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
-            lblGitInfo = new Label { Location = new Point(12, 36), Size = new Size(530, 22), ForeColor = Color.FromArgb(40, 80, 140), AutoEllipsis = true, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
+            int fh = this.Font.Height;
+            int initW = Math.Max(940, fh * 52);
+            int initH = Math.Max(740, fh * 41);
 
-            btnChangeDir = new Button { Text = "フォルダ変更...", Location = new Point(550, 16), Size = new Size(112, 34), BackColor = Color.White, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            Rectangle workArea = Screen.PrimaryScreen.WorkingArea;
+            if (initW > workArea.Width - 20) initW = workArea.Width - 20;
+            if (initH > workArea.Height - 20) initH = workArea.Height - 20;
+
+            this.Text = "VBA Git 管理ツール";
+            this.ClientSize = new Size(initW, initH);
+            this.MinimumSize = new Size(Math.Min(860, initW), Math.Min(680, initH));
+            this.StartPosition = FormStartPosition.CenterScreen;
+
+            // 上部ヘッダー
+            pnlTop = new Panel { BackColor = Color.FromArgb(240, 244, 248) };
+            lblTargetDir = new Label { AutoSize = false, Font = new Font("Yu Gothic UI", 9.5f, FontStyle.Bold), AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft };
+            lblGitInfo = new Label { AutoSize = false, ForeColor = Color.FromArgb(40, 80, 140), AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft };
+
+            btnChangeDir = CreateStyledButton("フォルダ変更...", BgWhite, FgBlack, false);
             btnChangeDir.Click += (s, e) => ChangeTargetDirectory();
 
-            btnHelp = new Button { Text = "ヘルプ / 使い方", Location = new Point(668, 16), Size = new Size(122, 34), BackColor = Color.FromArgb(230, 240, 255), Font = new Font("Yu Gothic UI", 9.5f, FontStyle.Bold), Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            btnHelp = CreateStyledButton("ヘルプ / 使い方", BgBlue, FgBlue, false);
             btnHelp.Click += (s, e) => ShowHelpWindow();
 
             pnlTop.Controls.AddRange(new Control[] { lblTargetDir, lblGitInfo, btnChangeDir, btnHelp });
 
-            // Group 1
-            grpSave = new GroupBox { Text = "1. 日常のセーブ・GitHub同期", Location = new Point(12, 76), Size = new Size(780, 105), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
-            Label lblMsg = new Label { Text = "コミットメモ:", Location = new Point(14, 28), Size = new Size(85, 22) };
-            txtCommitMsg = new TextBox { Location = new Point(102, 25), Size = new Size(440, 25), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
-            Label lblTag = new Label { Text = "タグ(任意):", Location = new Point(555, 28), Size = new Size(72, 22), Anchor = AnchorStyles.Top | AnchorStyles.Right };
-            txtTagName = new TextBox { Location = new Point(630, 25), Size = new Size(135, 25), Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            // Group 1: 日常のセーブ・GitHub同期
+            grpSave = new GroupBox { Text = "1. 日常のセーブ・GitHub同期" };
+            lblMsg = new Label { Text = "コミットメモ:", AutoSize = true };
+            txtCommitMsg = new TextBox();
+            lblTag = new Label { Text = "タグ(任意):", AutoSize = true };
+            txtTagName = new TextBox();
 
-            btnSave = new Button { Text = "Save (ローカル保存のみ)", Location = new Point(14, 60), Size = new Size(210, 34), BackColor = Color.FromArgb(230, 242, 255) };
+            // ローカル保存のみ青＆太字、GitHub送信系は標準（白背景・黒文字・太字なし）
+            btnSave = CreateStyledButton("Save (ローカル保存のみ)", BgBlue, FgBlue, true);
             btnSave.Click += async (s, e) => await RunOperationAsync(() => ExecuteSaveAsync(false));
 
-            btnSaveAndPush = new Button { Text = "Save ＆ GitHub送信 (一括)", Location = new Point(236, 60), Size = new Size(260, 34), BackColor = Color.FromArgb(215, 245, 225), Font = new Font("Yu Gothic UI", 9.5f, FontStyle.Bold) };
+            btnSaveAndPush = CreateStyledButton("Save ＆ GitHub送信 (一括)", BgWhite, FgBlack, false);
             btnSaveAndPush.Click += async (s, e) => await RunOperationAsync(() => ExecuteSaveAsync(true));
 
-            btnPushOnly = new Button { Text = "GitHub送信のみ (Push)", Location = new Point(508, 60), Size = new Size(257, 34), BackColor = Color.White, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            btnPushOnly = CreateStyledButton("GitHub送信のみ (Push)", BgWhite, FgBlack, false);
             btnPushOnly.Click += async (s, e) => await RunOperationAsync(() => ExecutePushOnlyAsync());
 
             grpSave.Controls.AddRange(new Control[] { lblMsg, txtCommitMsg, lblTag, txtTagName, btnSave, btnSaveAndPush, btnPushOnly });
 
-            // Group 2
-            grpRestore = new GroupBox { Text = "2. 取得・復元（やり直し） ※Excelを閉じてから実行", Location = new Point(12, 188), Size = new Size(780, 225), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
-            btnPull = new Button { Text = "Pull (GitHubから最新取得 ＋ Excel反映)", Location = new Point(14, 24), Size = new Size(370, 34), BackColor = Color.FromArgb(255, 248, 220) };
-            btnPull.Click += async (s, e) => await RunOperationAsync(() => ExecutePullAsync());
+            // Group 2: 取得・復元（やり直し）
+            grpRestore = new GroupBox { Text = "2. 取得・復元（やり直し） ※Excelを閉じてから実行" };
+            lblHist = new Label { Text = "過去の履歴・タグ一覧（選択して復元 or タグ付け）:", AutoSize = true };
 
-            btnRestoreLatest = new Button { Text = "直前のSave状態へ戻す (Latest)", Location = new Point(396, 24), Size = new Size(369, 34), BackColor = Color.FromArgb(255, 235, 235), Anchor = AnchorStyles.Top | AnchorStyles.Right };
-            btnRestoreLatest.Click += async (s, e) => await RunOperationAsync(() => ExecuteRestoreLatestAsync());
-
-            Label lblHist = new Label { Text = "過去の履歴・タグ一覧（選択して復元 or タグ付け）:", Location = new Point(14, 66), Size = new Size(400, 20) };
-            Button btnRefreshHist = new Button { Text = "履歴再読込", Location = new Point(675, 62), Size = new Size(90, 24), Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            // ⑦「履歴再読込」ボタンを青にする
+            btnRefreshHist = CreateStyledButton("履歴再読込", BgBlue, FgBlue, false);
             btnRefreshHist.Click += async (s, e) => await RunOperationAsync(() => RefreshHistoryListAsync());
 
-            lstHistory = new ListBox { Location = new Point(14, 88), Size = new Size(751, 88), Font = new Font("Consolas", 9.5f), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right, HorizontalScrollbar = true };
+            lstHistory = new ListBox { Font = new Font("Consolas", 9.5f), HorizontalScrollbar = true, IntegralHeight = false };
 
-            btnRestoreLocal = new Button { Text = "選択した履歴へ復元 (ローカル)", Location = new Point(14, 182), Size = new Size(250, 32), BackColor = Color.White };
+            // 選択した履歴へ復元 (ローカル) は青＆太字
+            btnRestoreLocal = CreateStyledButton("選択した履歴へ復元 (ローカル)", BgBlue, FgBlue, true);
             btnRestoreLocal.Click += async (s, e) => await RunOperationAsync(() => ExecuteRestoreSelectedAsync(false));
 
-            btnRestoreGithub = new Button { Text = "選択した履歴へ復元 (GitHubを取得後)", Location = new Point(274, 182), Size = new Size(270, 32), BackColor = Color.White };
+            // ②「直前のSave状態へ戻す (ローカル)」にして、緑の塗りつぶしと文字色を緑にする
+            btnRestoreLatest = CreateStyledButton("直前のSave状態へ戻す (ローカル)", BgGreen, FgGreen, false);
+            btnRestoreLatest.Click += async (s, e) => await RunOperationAsync(() => ExecuteRestoreLatestAsync());
+
+            // ③ Pull含め下段のボタンはすべて標準（白背景・黒文字・太字なし）
+            btnPull = CreateStyledButton("Pull (GitHub最新取得＋Excel反映)", BgWhite, FgBlack, false);
+            btnPull.Click += async (s, e) => await RunOperationAsync(() => ExecutePullAsync());
+
+            btnRestoreGithub = CreateStyledButton("選択した履歴へ復元 (GitHub取得後)", BgWhite, FgBlack, false);
             btnRestoreGithub.Click += async (s, e) => await RunOperationAsync(() => ExecuteRestoreSelectedAsync(true));
 
-            btnAddTag = new Button { Text = "選択履歴にタグ付与", Location = new Point(554, 182), Size = new Size(211, 32), BackColor = Color.White, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            btnAddTag = CreateStyledButton("選択履歴にタグ付与", BgWhite, FgBlack, false);
             btnAddTag.Click += async (s, e) => await RunOperationAsync(() => ExecuteTagSelectedAsync());
 
-            Button[] restoreButtons = { btnPull, btnRestoreLatest, btnRefreshHist, btnRestoreLocal, btnRestoreGithub, btnAddTag };
-            grpRestore.Controls.AddRange(new Control[] { lblHist, lstHistory });
-            grpRestore.Controls.AddRange(restoreButtons);
+            grpRestore.Controls.AddRange(new Control[] { lblHist, btnRefreshHist, lstHistory, btnRestoreLocal, btnRestoreLatest, btnPull, btnRestoreGithub, btnAddTag });
 
-            // Group 3
-            grpSetup = new GroupBox { Text = "3. 新規構築・初期設定・メンテナンス", Location = new Point(12, 420), Size = new Size(780, 68), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
+            // Group 3: 新規構築・初期設定・メンテナンス
+            grpSetup = new GroupBox { Text = "3. 新規構築・初期設定・メンテナンス" };
 
-            btnInitLocalNew = new Button { Text = "新規作成 (ローカル専用)", Location = new Point(14, 24), Size = new Size(245, 34), BackColor = Color.White };
+            btnInitLocalNew = CreateStyledButton("新規作成 (ローカル専用)", BgWhite, FgBlack, false);
             btnInitLocalNew.Click += async (s, e) => await RunOperationAsync(() => ExecuteInitLocalNewAsync());
 
-            btnCloneNew = new Button { Text = "新規クローン (GitHubから)", Location = new Point(269, 24), Size = new Size(245, 34), BackColor = Color.White };
+            btnCloneNew = CreateStyledButton("新規クローン (GitHubから)", BgWhite, FgBlack, false);
             btnCloneNew.Click += async (s, e) => await RunOperationAsync(() => ExecuteCloneNewAsync());
 
-            btnInitProject = new Button { Text = "初期設定 (.gitignore / 監視解除)", Location = new Point(524, 24), Size = new Size(241, 34), BackColor = Color.FromArgb(245, 250, 255), Font = new Font("Yu Gothic UI", 9.5f, FontStyle.Bold), Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            // ④ 初期設定ボタンの青の塗りつぶしをやめて、文字色も標準の黒（太字なし）にする
+            btnInitProject = CreateStyledButton("初期設定 (.gitignore / 監視解除)", BgWhite, FgBlack, false);
             btnInitProject.Click += async (s, e) => await RunOperationAsync(() => OpenInitProjectDialogAsync());
 
             grpSetup.Controls.AddRange(new Control[] { btnInitLocalNew, btnCloneNew, btnInitProject });
 
-            // Log
-            Label lblLog = new Label { Text = "実行ログ:", Location = new Point(14, 496), Size = new Size(100, 20) };
-            btnToggleReg = new Button { Text = "右クリックメニュー登録 / 解除", Location = new Point(570, 492), Size = new Size(222, 26), BackColor = Color.White, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            // 4. 実行ログ
+            lblLog = new Label { Text = "実行ログ:", AutoSize = true };
+            // ⑤ 右クリックメニュー登録ボタンの緑の塗りつぶしをやめて、文字色は標準の黒（太字なし）にする
+            btnToggleReg = CreateStyledButton("右クリックメニュー登録済み (解除する)", BgWhite, FgBlack, false);
             btnToggleReg.Click += (s, e) => ToggleContextMenuRegistration();
 
             txtLog = new TextBox
             {
-                Location = new Point(12, 520),
-                Size = new Size(780, 170),
                 Multiline = true,
                 ReadOnly = true,
                 ScrollBars = ScrollBars.Vertical,
                 BackColor = Color.FromArgb(30, 30, 30),
                 ForeColor = Color.FromArgb(220, 235, 220),
-                Font = new Font("Consolas", 9.5f),
-                Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
+                Font = new Font("Consolas", 9.5f)
             };
 
             this.Controls.AddRange(new Control[] { pnlTop, grpSave, grpRestore, grpSetup, lblLog, btnToggleReg, txtLog });
+            ApplyResponsiveLayout();
+        }
+
+        /// <summary>
+        /// ウィンドウサイズと実測文字サイズに基づき、すべてのコントロールを重なり・欠け無しで配置する。
+        /// </summary>
+        private void ApplyResponsiveLayout()
+        {
+            if (pnlTop == null || this.ClientSize.Width < 200 || this.ClientSize.Height < 200) return;
+
+            int cw = this.ClientSize.Width;
+            int ch = this.ClientSize.Height;
+
+            int fh = this.Font.Height;
+            int btnH = fh + 16;
+            int smallBtnH = fh + 10;
+            int pad = 12;
+            int innerPad = 14;
+            int gap = 10;
+
+            // 1. 上部ヘッダー
+            int topH = fh * 2 + 24;
+            pnlTop.Bounds = new Rectangle(0, 0, cw, topH);
+
+            int helpW = MeasureButtonWidth(btnHelp, 28);
+            int chgW = MeasureButtonWidth(btnChangeDir, 28);
+            int topBtnY = (topH - btnH) / 2;
+
+            btnHelp.Bounds = new Rectangle(cw - pad - helpW, topBtnY, helpW, btnH);
+            btnChangeDir.Bounds = new Rectangle(btnHelp.Left - 8 - chgW, topBtnY, chgW, btnH);
+
+            int infoW = Math.Max(100, btnChangeDir.Left - pad - 12);
+            lblTargetDir.Bounds = new Rectangle(pad, 8, infoW, fh + 4);
+            lblGitInfo.Bounds = new Rectangle(pad, 12 + fh, infoW, fh + 4);
+
+            int grpW = cw - pad * 2;
+            int innerW = grpW - innerPad * 2;
+
+            // 2. Group 1 (Save)
+            int grp1Y = topH + 8;
+            int grpTopMargin = fh + 8;
+            int txtH = txtCommitMsg.PreferredHeight;
+
+            int lblMsgW = TextRenderer.MeasureText(lblMsg.Text, lblMsg.Font).Width;
+            int lblTagW = TextRenderer.MeasureText(lblTag.Text, lblTag.Font).Width;
+
+            lblMsg.Location = new Point(innerPad, grpTopMargin + (txtH - fh) / 2);
+            int tagW = Math.Max(130, innerW / 6);
+            txtTagName.Bounds = new Rectangle(grpW - innerPad - tagW, grpTopMargin, tagW, txtH);
+            lblTag.Location = new Point(txtTagName.Left - lblTagW - 6, grpTopMargin + (txtH - fh) / 2);
+
+            int msgLeft = innerPad + lblMsgW + 6;
+            int msgW = Math.Max(100, lblTag.Left - 16 - msgLeft);
+            txtCommitMsg.Bounds = new Rectangle(msgLeft, grpTopMargin, msgW, txtH);
+
+            int saveBtnY = grpTopMargin + txtH + 10;
+            int w3_1 = (innerW - gap * 2) / 3;
+            int w3_2 = (innerW - gap * 2) / 3;
+            int w3_3 = innerW - gap * 2 - w3_1 - w3_2;
+
+            btnSave.Bounds = new Rectangle(innerPad, saveBtnY, w3_1, btnH);
+            btnSaveAndPush.Bounds = new Rectangle(btnSave.Right + gap, saveBtnY, w3_2, btnH);
+            btnPushOnly.Bounds = new Rectangle(btnSaveAndPush.Right + gap, saveBtnY, w3_3, btnH);
+
+            int grp1H = saveBtnY + btnH + 12;
+            grpSave.Bounds = new Rectangle(pad, grp1Y, grpW, grp1H);
+
+            // 3. Group 3 (Setup) の高さを確定
+            int setupBtnY = fh + 8;
+            int grp3H = setupBtnY + btnH + 12;
+
+            // 4. 残り高さを Group 2 (Restore) と Log に配分 (58% : 42%)
+            int logHeaderH = smallBtnH + 6;
+            int usedFixedH = grp1Y + grp1H + 8 + grp3H + 8 + logHeaderH + pad;
+            int availFlexH = Math.Max(220, ch - usedFixedH);
+            int grp2H = Math.Max(fh * 10, (int)(availFlexH * 0.58));
+
+            int grp2Y = grpSave.Bottom + 8;
+            grpRestore.Bounds = new Rectangle(pad, grp2Y, grpW, grp2H);
+
+            // Group 2 内部
+            int rHeaderY = fh + 6;
+            int refW = MeasureButtonWidth(btnRefreshHist, 24);
+            btnRefreshHist.Bounds = new Rectangle(grpW - innerPad - refW, rHeaderY, refW, smallBtnH);
+            lblHist.Location = new Point(innerPad, rHeaderY + (smallBtnH - fh) / 2);
+
+            int rBotRowY = grp2H - 12 - btnH;
+            int rMidRowY = rBotRowY - 8 - btnH;
+
+            // 中段：2等分 (ローカル復元)
+            int w2_1 = (innerW - gap) / 2;
+            int w2_2 = innerW - gap - w2_1;
+            btnRestoreLocal.Bounds = new Rectangle(innerPad, rMidRowY, w2_1, btnH);
+            btnRestoreLatest.Bounds = new Rectangle(btnRestoreLocal.Right + gap, rMidRowY, w2_2, btnH);
+
+            // 下段：3ボタン (37% : 37% : 26% で配分)
+            int subAvailW = innerW - gap * 2;
+            int ws1 = (int)(subAvailW * 0.37);
+            int ws2 = (int)(subAvailW * 0.37);
+            int ws3 = subAvailW - ws1 - ws2;
+            btnPull.Bounds = new Rectangle(innerPad, rBotRowY, ws1, btnH);
+            btnRestoreGithub.Bounds = new Rectangle(btnPull.Right + gap, rBotRowY, ws2, btnH);
+            btnAddTag.Bounds = new Rectangle(btnRestoreGithub.Right + gap, rBotRowY, ws3, btnH);
+
+            // 履歴リストボックス
+            int lstTop = btnRefreshHist.Bottom + 6;
+            int lstH = Math.Max(40, rMidRowY - 8 - lstTop);
+            lstHistory.Bounds = new Rectangle(innerPad, lstTop, innerW, lstH);
+
+            // 5. Group 3 (Setup)
+            int grp3Y = grpRestore.Bottom + 8;
+            grpSetup.Bounds = new Rectangle(pad, grp3Y, grpW, grp3H);
+            btnInitLocalNew.Bounds = new Rectangle(innerPad, setupBtnY, w3_1, btnH);
+            btnCloneNew.Bounds = new Rectangle(btnInitLocalNew.Right + gap, setupBtnY, w3_2, btnH);
+            btnInitProject.Bounds = new Rectangle(btnCloneNew.Right + gap, setupBtnY, w3_3, btnH);
+
+            // 6. 実行ログエリア
+            int logHeaderY = grpSetup.Bottom + 8;
+            int regW = MeasureButtonWidth(btnToggleReg, 28);
+            btnToggleReg.Bounds = new Rectangle(cw - pad - regW, logHeaderY, regW, smallBtnH);
+            lblLog.Location = new Point(pad + 2, logHeaderY + (smallBtnH - fh) / 2);
+
+            int txtLogTop = btnToggleReg.Bottom + 6;
+            int txtLogH = Math.Max(60, ch - pad - txtLogTop);
+            txtLog.Bounds = new Rectangle(pad, txtLogTop, grpW, txtLogH);
         }
 
         private void ShowHelpWindow()
@@ -543,16 +770,11 @@ namespace VbaGitTool
         // ---------------------------------------------------------------------
         // 実行制御（排他・例外処理）
         // ---------------------------------------------------------------------
-        /// <summary>
-        /// すべての操作はここを通す。処理中は操作ロック、例外は握ってログへ、
-        /// 終了時は必ず状態を再読込してUIを復帰させる。
-        /// </summary>
         private async Task RunOperationAsync(Func<Task> body)
         {
             if (_busy) return;
             SetBusy(true);
 
-            // C# 5 では catch / finally の中で await できないため、例外は変数に退避する
             Exception error = null;
             try
             {
@@ -598,6 +820,11 @@ namespace VbaGitTool
             SetBusy(true);
             try
             {
+                if (_initialDirAdjusted)
+                {
+                    AppendLog("[案内] サブフォルダ(bin/src等)から起動されたため、1階層上の親フォルダへ自動補正しました: " + _targetDir);
+                }
+
                 var r = await _cmd.RunAsync("git", "--version", _appDir, true);
                 _gitAvailable = r.Success;
                 if (!_gitAvailable)
@@ -620,6 +847,14 @@ namespace VbaGitTool
 
         private async Task LoadDirectoryContextAsync()
         {
+            bool adjusted;
+            string resolved = ProjectFiles.ResolveProjectRoot(_targetDir, out adjusted);
+            if (adjusted)
+            {
+                _targetDir = resolved;
+                AppendLog("[案内] 親フォルダ（開発用フォルダ）を検出したため、対象フォルダを自動補正しました: " + _targetDir);
+            }
+
             lblTargetDir.Text = "対象フォルダ: " + _targetDir;
             UpdateRegButtonText();
 
@@ -650,7 +885,6 @@ namespace VbaGitTool
                 return;
             }
 
-            // symbolic-ref はコミット未作成のブランチでも動く。detached HEAD では失敗する。
             var br = await _cmd.GitAsync(_targetDir, true, "symbolic-ref", "--short", "-q", "HEAD");
             _branch = br.Success ? br.Output.Trim() : null;
             if (string.IsNullOrEmpty(_branch)) _branch = null;
@@ -683,12 +917,15 @@ namespace VbaGitTool
             btnRestoreLatest.Enabled = isGitRepo;
             btnRestoreLocal.Enabled = isGitRepo;
             btnAddTag.Enabled = isGitRepo;
+            btnRefreshHist.Enabled = isGitRepo;
             btnInitProject.Enabled = isGitRepo;
 
             btnSaveAndPush.Enabled = isGitRepo && canSync;
             btnPushOnly.Enabled = isGitRepo && canSync;
             btnPull.Enabled = isGitRepo && canSync;
             btnRestoreGithub.Enabled = isGitRepo && hasRemote;
+
+            this.Invalidate(true);
         }
 
         private void ChangeTargetDirectory()
@@ -698,8 +935,13 @@ namespace VbaGitTool
             {
                 if (dlg.ShowDialog() == DialogResult.OK)
                 {
-                    _targetDir = dlg.SelectedPath;
+                    bool adjusted;
+                    _targetDir = ProjectFiles.ResolveProjectRoot(dlg.SelectedPath, out adjusted);
                     txtLog.Clear();
+                    if (adjusted)
+                    {
+                        AppendLog("[案内] サブフォルダが選択されたため、1階層上の親フォルダへ自動補正しました: " + _targetDir);
+                    }
                     var ignored = RunOperationAsync(() => Task.FromResult(0));
                 }
             }
@@ -761,7 +1003,6 @@ namespace VbaGitTool
             }
         }
 
-        /// <summary>上書き系の処理の前に、src と bin を退避する。続行してよければ true。</summary>
         private async Task<bool> BackupBeforeOverwriteAsync(string dir)
         {
             string path = await Task.Run(() => ProjectFiles.BackupWorkingState(dir, AppendLog));
@@ -783,7 +1024,6 @@ namespace VbaGitTool
 
         private async Task<bool> HasStagedChangesAsync(string dir)
         {
-            // 0 = 差分なし, 1 = 差分あり, それ以外 = エラー（安全側で「あり」と扱う）
             var r = await _cmd.GitAsync(dir, true, "diff", "--cached", "--quiet");
             return r.ExitCode != 0;
         }
@@ -797,9 +1037,9 @@ namespace VbaGitTool
 
             var r = MessageBox.Show(
                 ".gitignore に bin/ の除外設定が見つかりません。\nこのまま Save すると、binフォルダ内のExcelブック(.xlsm等)がそのままGitに登録される可能性があります。\n\n" +
-                "[はい]　標準の除外設定（bin/* , ~$* ）を自動追加して続行\n" +
-                "[いいえ]　除外設定なしで続行\n" +
-                "[キャンセル]　Saveを中止",
+                "[はい] 標準の除外設定（bin/* , ~$* ）を自動追加して続行\n" +
+                "[いいえ] 除外設定なしで続行\n" +
+                "[キャンセル] Saveを中止",
                 "除外設定の確認", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning);
 
             if (r == DialogResult.Cancel) return false;
@@ -927,13 +1167,8 @@ namespace VbaGitTool
         // ---------------------------------------------------------------------
         // 復元
         // ---------------------------------------------------------------------
-        /// <summary>
-        /// src/ を指定リビジョンの内容に完全置換する。
-        /// （単なる checkout だと、その時点で存在しないファイルが src/ に残るため、いったん削除してから復元する）
-        /// </summary>
         private async Task<bool> ReplaceSrcWithRevisionAsync(string dir, string rev)
         {
-            // そのリビジョンに src/ があるか事前確認（無いのに消してしまう事故を防ぐ）
             var chk = await _cmd.GitAsync(dir, true, "cat-file", "-e", rev + ":src");
             if (!chk.Success)
             {
@@ -1049,7 +1284,7 @@ namespace VbaGitTool
             }
             string commitHash = item.Hash;
 
-            string tagName = PromptInput("バージョンタグの付与", string.Format("選択履歴 [{0}] に付けるタグ名を入力してください（例: v1.0）:", commitHash), "v1.0");
+            string tagName = PromptInput("バージョンタグの付与", string.Format("選択履歴 [{0}] に付けるタグ名を入力してください\n（完成版や配布時の目印として使います。例: v1.0）:", commitHash), "v1.0");
             if (string.IsNullOrWhiteSpace(tagName)) return;
             tagName = tagName.Trim();
 
@@ -1101,7 +1336,6 @@ namespace VbaGitTool
                 return;
             }
 
-            // コミット前でも、古いgitでも動く方法でブランチ名を main に統一
             await _cmd.GitAsync(newProjectPath, true, "symbolic-ref", "HEAD", "refs/heads/main");
 
             ProjectFiles.EnsureDefaultGitignore(newProjectPath);
@@ -1176,28 +1410,40 @@ namespace VbaGitTool
 
             using (Form dlg = new Form())
             {
-                dlg.AutoScaleDimensions = new SizeF(96F, 96F);
-                dlg.AutoScaleMode = AutoScaleMode.Dpi;
+                dlg.AutoScaleMode = AutoScaleMode.None;
                 dlg.Font = this.Font;
+                int fh = this.Font.Height;
                 dlg.Text = "プロジェクト初期設定（.gitignore 編集 ＆ 監視解除）";
-                dlg.Size = new Size(520, 440);
+                dlg.ClientSize = new Size(Math.Max(600, fh * 34), Math.Max(460, fh * 26));
+                dlg.MinimumSize = new Size(540, 400);
                 dlg.StartPosition = FormStartPosition.CenterParent;
-                dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
-                dlg.MaximizeBox = false;
-                dlg.MinimizeBox = false;
 
-                Label lbl = new Label { Text = "現在の .gitignore 内容（1行ずつ自由に編集・追加・削除できます）:", Location = new Point(14, 12), Size = new Size(480, 22) };
-                TextBox txtIgnore = new TextBox
+                var tlp = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Padding = new Padding(12) };
+                tlp.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+                tlp.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                tlp.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+                tlp.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                tlp.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                tlp.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+                var lbl = new Label { Text = "現在の .gitignore 内容（1行ずつ自由に編集・追加・削除できます）:", AutoSize = true, Margin = new Padding(0, 0, 0, 6) };
+                var txtIgnore = new TextBox
                 {
-                    Location = new Point(14, 38),
-                    Size = new Size(476, 220),
+                    Dock = DockStyle.Fill,
                     Multiline = true,
                     ScrollBars = ScrollBars.Vertical,
                     Font = new Font("Consolas", 10f),
                     Text = File.ReadAllText(gitignorePath, Encoding.UTF8)
                 };
 
-                Button btnAddPreset = new Button { Text = "標準除外セットを追加 (*.bat / *.txt / vbac.wsf)", Location = new Point(14, 268), Size = new Size(320, 30) };
+                var btnAddPreset = new Button
+                {
+                    Text = "標準除外セットを追加 (*.bat / *.txt / vbac.wsf)",
+                    AutoSize = true,
+                    Padding = new Padding(8, 3, 8, 3),
+                    BackColor = Color.White,
+                    Margin = new Padding(0, 8, 0, 4)
+                };
                 btnAddPreset.Click += (s, e) =>
                 {
                     var lines = txtIgnore.Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None).Select(l => l.Trim()).ToList();
@@ -1209,20 +1455,51 @@ namespace VbaGitTool
                 };
 
                 bool tplExists = File.Exists(tplPath);
-                CheckBox chkDelPushTpl = new CheckBox
+                var chkDelPushTpl = new CheckBox
                 {
                     Text = "フォルダ内に push_template.bat が残っていたら削除する",
-                    Location = new Point(16, 308),
-                    Size = new Size(460, 24),
+                    AutoSize = true,
                     Checked = tplExists,
-                    Enabled = tplExists
+                    Enabled = tplExists,
+                    Margin = new Padding(2, 4, 0, 8)
                 };
 
-                Button btnOk = new Button { Text = "確定してGit(ローカル/GitHub)から除外反映", Location = new Point(220, 348), Size = new Size(270, 38), BackColor = Color.FromArgb(215, 245, 225), Font = new Font("Yu Gothic UI", 9.5f, FontStyle.Bold), DialogResult = DialogResult.OK };
-                Button btnCancel = new Button { Text = "キャンセル", Location = new Point(110, 348), Size = new Size(100, 38), DialogResult = DialogResult.Cancel };
+                var pnlBtns = new FlowLayoutPanel
+                {
+                    Dock = DockStyle.Fill,
+                    FlowDirection = FlowDirection.RightToLeft,
+                    AutoSize = true,
+                    Margin = new Padding(0)
+                };
+                var btnOk = new Button
+                {
+                    Text = "確定してGit(ローカル/GitHub)から除外反映",
+                    AutoSize = true,
+                    Padding = new Padding(10, 5, 10, 5),
+                    BackColor = BgBlue,
+                    ForeColor = FgBlue,
+                    Font = new Font("Yu Gothic UI", 9.5f, FontStyle.Bold),
+                    DialogResult = DialogResult.OK
+                };
+                var btnCancel = new Button
+                {
+                    Text = "キャンセル",
+                    AutoSize = true,
+                    Padding = new Padding(10, 5, 10, 5),
+                    BackColor = Color.White,
+                    DialogResult = DialogResult.Cancel,
+                    Margin = new Padding(0, 0, 8, 0)
+                };
+                pnlBtns.Controls.Add(btnOk);
+                pnlBtns.Controls.Add(btnCancel);
 
-                dlg.Controls.AddRange(new Control[] { lbl, txtIgnore, btnAddPreset, chkDelPushTpl, btnOk, btnCancel });
-                dlg.AcceptButton = null;
+                tlp.Controls.Add(lbl, 0, 0);
+                tlp.Controls.Add(txtIgnore, 0, 1);
+                tlp.Controls.Add(btnAddPreset, 0, 2);
+                tlp.Controls.Add(chkDelPushTpl, 0, 3);
+                tlp.Controls.Add(pnlBtns, 0, 4);
+
+                dlg.Controls.Add(tlp);
                 dlg.CancelButton = btnCancel;
 
                 if (dlg.ShowDialog(this) != DialogResult.OK) return;
@@ -1267,7 +1544,6 @@ namespace VbaGitTool
                 AppendLog("[案内] 変更がないため、コミットはスキップされました。");
             }
 
-            // 現在の状態を最新化して判定
             var br = await _cmd.GitAsync(dir, true, "symbolic-ref", "--short", "-q", "HEAD");
             string branch = br.Success ? br.Output.Trim() : "";
             var rm = await _cmd.GitAsync(dir, true, "remote", "get-url", "origin");
@@ -1303,20 +1579,21 @@ namespace VbaGitTool
         }
 
         // ---------------------------------------------------------------------
-        // 右クリックメニュー
+        // 右クリックメニュー (⑤ 常に塗りつぶしなし・黒文字・標準フォントを維持)
         // ---------------------------------------------------------------------
         private void UpdateRegButtonText()
         {
             if (ContextMenuRegistrar.IsRegistered())
             {
                 btnToggleReg.Text = "右クリックメニュー登録済み (解除する)";
-                btnToggleReg.BackColor = Color.FromArgb(225, 245, 230);
             }
             else
             {
                 btnToggleReg.Text = "右クリックメニューに登録する";
-                btnToggleReg.BackColor = Color.FromArgb(255, 245, 225);
             }
+            btnToggleReg.BackColor = BgWhite;
+            btnToggleReg.ForeColor = FgBlack;
+            ApplyResponsiveLayout();
         }
 
         private void ToggleContextMenuRegistration()
@@ -1360,22 +1637,36 @@ namespace VbaGitTool
         {
             using (Form f = new Form())
             {
-                f.AutoScaleDimensions = new SizeF(96F, 96F);
-                f.AutoScaleMode = AutoScaleMode.Dpi;
+                f.AutoScaleMode = AutoScaleMode.None;
                 f.Font = this.Font;
+                int fh = this.Font.Height;
                 f.Text = title;
-                f.Size = new Size(540, 205);
+                f.ClientSize = new Size(Math.Max(540, fh * 30), Math.Max(195, fh * 11));
                 f.StartPosition = FormStartPosition.CenterParent;
                 f.FormBorderStyle = FormBorderStyle.FixedDialog;
                 f.MaximizeBox = false;
                 f.MinimizeBox = false;
 
-                Label lbl = new Label { Text = prompt, Location = new Point(14, 14), Size = new Size(500, 60) };
-                TextBox txt = new TextBox { Text = defaultVal, Location = new Point(14, 82), Size = new Size(496, 25) };
-                Button ok = new Button { Text = "OK", Location = new Point(340, 122), Size = new Size(80, 30), DialogResult = DialogResult.OK };
-                Button cancel = new Button { Text = "キャンセル", Location = new Point(430, 122), Size = new Size(80, 30), DialogResult = DialogResult.Cancel };
+                var tlp = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(14) };
+                tlp.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+                tlp.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+                tlp.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                tlp.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-                f.Controls.AddRange(new Control[] { lbl, txt, ok, cancel });
+                var lbl = new Label { Text = prompt, Dock = DockStyle.Fill, AutoSize = true };
+                var txt = new TextBox { Text = defaultVal, Dock = DockStyle.Fill, Margin = new Padding(0, 6, 0, 10) };
+
+                var pnlBtns = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, AutoSize = true, Margin = new Padding(0) };
+                var cancel = new Button { Text = "キャンセル", AutoSize = true, Padding = new Padding(10, 3, 10, 3), DialogResult = DialogResult.Cancel };
+                var ok = new Button { Text = "OK", AutoSize = true, Padding = new Padding(16, 3, 16, 3), DialogResult = DialogResult.OK, Margin = new Padding(0, 0, 8, 0) };
+                pnlBtns.Controls.Add(cancel);
+                pnlBtns.Controls.Add(ok);
+
+                tlp.Controls.Add(lbl, 0, 0);
+                tlp.Controls.Add(txt, 0, 1);
+                tlp.Controls.Add(pnlBtns, 0, 2);
+
+                f.Controls.Add(tlp);
                 f.AcceptButton = ok;
                 f.CancelButton = cancel;
 
@@ -1391,22 +1682,31 @@ namespace VbaGitTool
     {
         public HelpForm()
         {
-            this.AutoScaleDimensions = new SizeF(96F, 96F);
-            this.AutoScaleMode = AutoScaleMode.Dpi;
-            this.Text = "VBA Git 管理ツール - 使い方ガイド";
-            this.Size = new Size(680, 560);
-            this.StartPosition = FormStartPosition.CenterParent;
+            this.AutoScaleMode = AutoScaleMode.None;
             this.Font = new Font("Yu Gothic UI", 9.5f, FontStyle.Regular);
+            int fh = this.Font.Height;
 
-            TabControl tabs = new TabControl { Dock = DockStyle.Fill, Padding = new Point(10, 6) };
+            this.Text = "VBA Git 管理ツール - 使い方ガイド";
+            this.ClientSize = new Size(Math.Max(720, fh * 40), Math.Max(560, fh * 31));
+            this.MinimumSize = new Size(600, 450);
+            this.StartPosition = FormStartPosition.CenterParent;
+
+            var tabs = new TabControl { Dock = DockStyle.Fill, Padding = new Point(10, 6) };
 
             tabs.TabPages.Add(CreateTab("1. 日常の開発サイクル", GetDailyGuideText()));
             tabs.TabPages.Add(CreateTab("2. 新規案件の立ち上げ", GetNewProjectGuideText()));
             tabs.TabPages.Add(CreateTab("3. やり直し・復元方法", GetRestoreGuideText()));
             tabs.TabPages.Add(CreateTab("4. ボタン機能一覧", GetReferenceGuideText()));
 
-            Panel pnlBottom = new Panel { Dock = DockStyle.Bottom, Height = 48, BackColor = Color.FromArgb(245, 245, 245) };
-            Button btnClose = new Button { Text = "閉じる", Location = new Point(550, 8), Size = new Size(100, 32), BackColor = Color.White, Anchor = AnchorStyles.Top | AnchorStyles.Right };
+            var pnlBottom = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Bottom,
+                FlowDirection = FlowDirection.RightToLeft,
+                AutoSize = true,
+                BackColor = Color.FromArgb(245, 245, 245),
+                Padding = new Padding(10, 8, 10, 8)
+            };
+            var btnClose = new Button { Text = "閉じる", AutoSize = true, Padding = new Padding(14, 4, 14, 4), BackColor = Color.White };
             btnClose.Click += (s, e) => this.Close();
             pnlBottom.Controls.Add(btnClose);
 
@@ -1416,8 +1716,8 @@ namespace VbaGitTool
 
         private TabPage CreateTab(string title, string content)
         {
-            TabPage page = new TabPage(title) { Padding = new Padding(8), BackColor = Color.White };
-            TextBox txt = new TextBox
+            var page = new TabPage(title) { Padding = new Padding(8), BackColor = Color.White };
+            var txt = new TextBox
             {
                 Dock = DockStyle.Fill,
                 Multiline = true,
@@ -1436,8 +1736,9 @@ namespace VbaGitTool
         {
             return
                 "【日々のコーディング時の基本ステップ】\r\n\r\n" +
-                "1. Excel側でマクロを編集し、上書き保存（Ctrl + S）する\r\n\r\n" +
-                "2. フォルダ内を右クリック ＞「VBA Git 管理ツールを開く」\r\n\r\n" +
+                "1. binフォルダ内のExcelでマクロを編集し、上書き保存（Ctrl + S）する\r\n\r\n" +
+                "2. フォルダ内を右クリック ＞「VBA Git 管理ツールを開く」\r\n" +
+                "   （※うっかり bin や src フォルダ内で起動しても、自動で親フォルダへ補正されます）\r\n\r\n" +
                 "3.「コミットメモ」に修正内容を入力する\r\n" +
                 "   （空欄のままでも自動で日時メモが入ります）\r\n\r\n" +
                 "4. タイミングに合わせてボタンを押す\r\n" +
@@ -1448,7 +1749,7 @@ namespace VbaGitTool
                 "------------------------------------------------------------\r\n" +
                 "【別のPCで作業を引き継ぐ時（GitHub利用時）】\r\n\r\n" +
                 "1. 必ずExcelブックを閉じた状態にする\r\n" +
-                "2. フォルダを右クリックしてツールを開き、[Pull (GitHubから最新取得 ＋ Excel反映)] を押す\r\n" +
+                "2. フォルダを右クリックしてツールを開き、[Pull (GitHub最新取得＋Excel反映)] を押す\r\n" +
                 "3. GitHubから最新コードを取得し、binフォルダ内のExcelへ自動反映されます。\r\n" +
                 "   （実行前に現在の状態が自動で退避されます）";
         }
@@ -1457,13 +1758,13 @@ namespace VbaGitTool
         {
             return
                 "【新しいVBA案件を始める時のステップ】\r\n\r\n" +
-                "■ パターンA：手元のPC内だけで管理する（社外秘・外部サーバー不可の場合）\r\n" +
+                "■ パターンA：手元のPC内だけで管理する（社外秘・単独開発など、最も一般的な使い方）\r\n" +
                 "  1. 案件のフォルダを作りたい「親フォルダ」で右クリックして本ツールを開く\r\n" +
                 "  2. [新規作成 (ローカル専用)] を押し、フォルダ名を入力する\r\n" +
                 "  3. 新しいフォルダが作成され、自動的に切り替わります\r\n" +
                 "     （標準の .gitignore と bin/.gitkeep も自動作成されます）\r\n" +
                 "  4. 必要なら [初期設定 (.gitignore / 監視解除)] で除外設定を編集します\r\n" +
-                "  5. binフォルダにExcelファイルを入れ、[Save] を押せば初期登録完了です！\r\n\r\n" +
+                "  5. 自動作成された bin フォルダにExcelファイルを入れ、[Save] を押せば初期登録完了です！\r\n\r\n" +
                 "■ パターンB：GitHubを利用してバックアップや共有を行う場合\r\n" +
                 "  1. GitHub上で新しい空のリポジトリを作成し、URLをコピーします\r\n" +
                 "  2. 親フォルダで本ツールを開き、[新規クローン (GitHubから)] を押します\r\n" +
@@ -1480,15 +1781,17 @@ namespace VbaGitTool
                 "※復元・Pullの実行前に、現在の src と bin の内容が\r\n" +
                 "  「.git\\vbagit_backup\\日時」へ自動退避されます（直近10回分を保持）。\r\n" +
                 "  万一おかしくなった場合は、そこから手動で戻せます。\r\n\r\n" +
-                "■ パターンA：さっきSaveした直前の状態に戻したい\r\n" +
-                "  → [直前のSave状態へ戻す (Latest)] を押します。\r\n" +
-                "     最後に Save した時点のコードがExcelブックへ書き戻されます。\r\n\r\n" +
-                "■ パターンB：昨日や先週など、特定の履歴・タグ時点に戻したい\r\n" +
-                "  1. 画面中央の「過去の履歴・タグ一覧」から戻りたい行をクリックして選択します。\r\n" +
-                "  2. [選択した履歴へ復元 (ローカル)] または [GitHubを取得後] を押します。\r\n" +
+                "■ パターンA：昨日や先週など、特定の履歴・タグ時点に戻したい（最も使う復元）\r\n" +
+                "  1.「過去の履歴・タグ一覧」から戻りたい行をクリックして選択します。\r\n" +
+                "  2. [選択した履歴へ復元 (ローカル)] を押します（GitHub上の履歴を使う場合は [GitHub取得後]）。\r\n" +
                 "  3. Excelを開いて動作を確認し、その状態を新しい最新版として確定させる場合は\r\n" +
                 "     再度 [Save]（または GitHub送信）を押してください。\r\n\r\n" +
-                "■ バージョンタグ（v1.0 など）を後から付けたい時\r\n" +
+                "■ パターンB：さっきSaveした直前の状態にすぐ戻したい\r\n" +
+                "  → [直前のSave状態へ戻す (ローカル)] を押します。\r\n" +
+                "     最後に Save した時点のコードがExcelブックへ書き戻されます。\r\n\r\n" +
+                "■ バージョンタグ（v1.0 など）を付けるタイミングと使い方\r\n" +
+                "  日々の細かいSaveではなく、「v1.0完成！」「他部署への配布版」「大改修の直前」など、\r\n" +
+                "  後からすぐに見つけ出したい重要な節目（マイルストーン）に「しおり」として使います。\r\n" +
                 "  ・履歴一覧から行を選択して [選択履歴にタグ付与] を押し、タグ名を入力します。\r\n" +
                 "  ・その後 [GitHub送信のみ (Push)] を押すとGitHub上にもタグが反映されます。";
         }
@@ -1499,17 +1802,18 @@ namespace VbaGitTool
                 "【各ボタンの機能と安全装置について】\r\n\r\n" +
                 "・Save (ローカル保存のみ)\r\n" +
                 "  bin内のExcelからVBAコードを抽出し、手元のPC（ローカルGit）に履歴を記録します。\r\n\r\n" +
-                "・Save ＆ GitHub送信 (一括)\r\n" +
-                "  上記のSaveに加え、GitHubへバックアップ送信（Push）まで一気に行います。\r\n" +
-                "  （リモート未設定・detached HEAD の場合は無効になります）\r\n\r\n" +
-                "・GitHub送信のみ (Push)\r\n" +
-                "  ローカルにSave済みの履歴や、後から付けたタグをGitHubへ送信します。\r\n\r\n" +
-                "・新規作成 / 新規クローン / 初期設定 (.gitignore / 監視解除)\r\n" +
-                "  空のプロジェクト作成、URLからの環境複製、除外ファイル設定を行います。\r\n\r\n" +
-                "・Excel使用中警告（安全装置）\r\n" +
-                "  Pullや復元時にbin内にロックファイル（~$*.xlsm）がある場合は処理を中断します。\r\n\r\n" +
-                "・自動退避\r\n" +
-                "  Pull / 復元の直前に src と bin を .git\\vbagit_backup へコピーします。";
+                "・Save ＆ GitHub送信 (一括) / GitHub送信のみ (Push)\r\n" +
+                "  ローカルの履歴や後から付けたタグをGitHubへバックアップ送信します。\r\n\r\n" +
+                "・選択した履歴へ復元 (ローカル) / 直前のSave状態へ戻す (ローカル)\r\n" +
+                "  手元のPCに記録された履歴から、指定時点（または直前）のVBAコードをExcelへ書き戻します。\r\n\r\n" +
+                "・Pull / 選択した履歴へ復元 (GitHub取得後)\r\n" +
+                "  GitHub上の最新変更や過去履歴を取得してExcelへ反映します。\r\n\r\n" +
+                "・選択履歴にタグ付与\r\n" +
+                "  完成版や配布版など、重要な節目の履歴に「v1.0」等の目印（タグ）を付けます。\r\n\r\n" +
+                "・親フォルダ自動補正（スマート判定）\r\n" +
+                "  誤って bin や src フォルダ内で起動しても、1階層上の親フォルダを自動認識します。\r\n\r\n" +
+                "・Excel使用中警告 ＆ 自動退避（安全装置）\r\n" +
+                "  Excelが開いたままの復元を防止し、実行直前に .git\\vbagit_backup へ自動バックアップします。";
         }
     }
 }
