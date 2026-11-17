@@ -1,6 +1,7 @@
 // VBA Git 管理ツール 最終完成版 (srcフォルダ自動隠し属性対応・ローカル管理特化版)　2026年11月17日 更新
 // 追加: コミットメモ確認＋日時付与 / 記録者(user.name・email)の初回登録 / Save時のブック世代バックアップ(backupフォルダ)
 // 変更: ブックのバックアップは backup 直下に「ブック名_月.日_時分.拡張子」で保存（Saveの日時＝コミットメモ末尾の日時）
+// 第1段: Save前のExcel保存確認 / 履歴に変更モジュールを表示
 // ビルド例 (C# 5 互換 / .NET Framework 4.x):
 //   csc /target:winexe /out:VbaGitTool.exe VbaGitTool.cs /r:System.Windows.Forms.dll /r:System.Drawing.dll
 
@@ -11,7 +12,9 @@ using System.Drawing;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.InteropServices;
+using ComTypes = System.Runtime.InteropServices.ComTypes;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
@@ -255,6 +258,181 @@ namespace VbaGitTool
     }
 
     // =========================================================================
+    // Excel 連携（起動中のExcelから bin 内ブックの保存状態を確認し、必要なら保存する）
+    // =========================================================================
+    public class OpenWorkbook
+    {
+        public string FullName;
+        public string Name;
+        public bool Saved;        // true = 保存していない変更なし
+        public bool ReadOnly;
+        public bool Unreadable;   // Excelが操作を受け付けず、状態を確認できなかった
+        public string Error;
+        public object Com;
+    }
+
+    public static class ExcelBridge
+    {
+        [DllImport("ole32.dll")]
+        private static extern int GetRunningObjectTable(int reserved, out ComTypes.IRunningObjectTable prot);
+
+        [DllImport("ole32.dll")]
+        private static extern int CreateBindCtx(int reserved, out ComTypes.IBindCtx ppbc);
+
+        private static object GetProp(object o, string name)
+        {
+            return o.GetType().InvokeMember(name, BindingFlags.GetProperty, null, o, null);
+        }
+
+        private static Exception Unwrap(Exception ex)
+        {
+            TargetInvocationException tie = ex as TargetInvocationException;
+            return (tie != null && tie.InnerException != null) ? tie.InnerException : ex;
+        }
+
+        private static bool IsTargetPath(string display, string binDir)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(display) || !Path.IsPathRooted(display)) return false;
+                if (!ProjectFiles.IsWorkbook(display)) return false;
+                string dir = Path.GetDirectoryName(display);
+                if (dir == null) return false;
+                return string.Equals(dir.TrimEnd('\\', '/'), binDir.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 起動中の全Excel（複数起動も含む）から、binDir 直下のブックを探して保存状態を取得する。
+        /// 使い終わったら Release を呼ぶこと。
+        /// </summary>
+        public static List<OpenWorkbook> FindOpenWorkbooks(string binDir, Action<string> log)
+        {
+            var result = new List<OpenWorkbook>();
+            ComTypes.IRunningObjectTable rot = null;
+            ComTypes.IEnumMoniker en = null;
+            try
+            {
+                string target;
+                try { target = Path.GetFullPath(binDir); }
+                catch { return result; }
+
+                if (GetRunningObjectTable(0, out rot) != 0 || rot == null) return result;
+                rot.EnumRunning(out en);
+                if (en == null) return result;
+                en.Reset();
+
+                var mons = new ComTypes.IMoniker[1];
+                while (en.Next(1, mons, IntPtr.Zero) == 0)
+                {
+                    ComTypes.IMoniker mon = mons[0];
+                    ComTypes.IBindCtx ctx = null;
+                    object obj = null;
+                    try
+                    {
+                        if (CreateBindCtx(0, out ctx) != 0 || ctx == null) continue;
+
+                        string display;
+                        mon.GetDisplayName(ctx, null, out display);
+                        if (!IsTargetPath(display, target)) continue;
+
+                        rot.GetObject(mon, out obj);
+                        if (obj == null) continue;
+
+                        var wb = new OpenWorkbook { FullName = display, Name = Path.GetFileName(display), Com = obj };
+                        try
+                        {
+                            wb.Saved = (bool)GetProp(obj, "Saved");
+                            wb.ReadOnly = (bool)GetProp(obj, "ReadOnly");
+                        }
+                        catch (Exception ex)
+                        {
+                            wb.Unreadable = true;
+                            wb.Error = Unwrap(ex).Message;
+                        }
+                        result.Add(wb);
+                        obj = null;   // 所有権を result へ移した
+                    }
+                    catch (Exception ex)
+                    {
+                        if (log != null) log("[警告] Excel連携の確認中にエラーが発生しました: " + Unwrap(ex).Message);
+                    }
+                    finally
+                    {
+                        if (obj != null) { try { Marshal.ReleaseComObject(obj); } catch { } }
+                        if (ctx != null) { try { Marshal.ReleaseComObject(ctx); } catch { } }
+                        if (mon != null) { try { Marshal.ReleaseComObject(mon); } catch { } }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (log != null) log("[警告] 起動中のExcelを確認できませんでした: " + Unwrap(ex).Message);
+            }
+            finally
+            {
+                if (en != null) { try { Marshal.ReleaseComObject(en); } catch { } }
+                if (rot != null) { try { Marshal.ReleaseComObject(rot); } catch { } }
+            }
+            return result;
+        }
+
+        /// <summary>ブックを上書き保存する。Excelが取り込み中のときは数回やり直す。</summary>
+        public static bool TrySave(OpenWorkbook wb, out string error)
+        {
+            error = "";
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                try
+                {
+                    wb.Com.GetType().InvokeMember("Save", BindingFlags.InvokeMethod, null, wb.Com, null);
+
+                    // ブック内のマクロ(BeforeSave等)が保存を取りやめた場合に備えて、保存済みになったか確認する
+                    bool saved = (bool)GetProp(wb.Com, "Saved");
+                    if (!saved)
+                    {
+                        error = "保存が完了しませんでした（ブック内のマクロが保存を中止した可能性があります）。";
+                        return false;
+                    }
+                    wb.Saved = true;
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Exception inner = Unwrap(ex);
+                    COMException ce = inner as COMException;
+                    uint code = ce != null ? unchecked((uint)ce.ErrorCode) : 0;
+                    bool busy = (code == 0x80010001u || code == 0x8001010Au);   // 呼び出し拒否 / しばらくしてから再試行
+                    if (busy && attempt < 2)
+                    {
+                        System.Threading.Thread.Sleep(700);
+                        continue;
+                    }
+                    error = busy
+                        ? "Excelが操作を受け付けられませんでした（セルの編集中や、ダイアログが開いている可能性があります）。"
+                        : inner.Message;
+                    return false;
+                }
+            }
+            return false;
+        }
+
+        public static void Release(List<OpenWorkbook> list)
+        {
+            if (list == null) return;
+            foreach (OpenWorkbook w in list)
+            {
+                try { if (w.Com != null) Marshal.ReleaseComObject(w.Com); } catch { }
+                w.Com = null;
+            }
+        }
+    }
+
+    // =========================================================================
     // 退避（バックアップ）/ .gitignore 補助 / フォルダ自動補正 / src隠し属性
     // =========================================================================
     public static class ProjectFiles
@@ -408,7 +586,7 @@ namespace VbaGitTool
             return total;
         }
 
-        private static bool IsWorkbook(string path)
+        public static bool IsWorkbook(string path)
         {
             string name = Path.GetFileName(path);
             if (name.StartsWith("~$")) return false;
@@ -687,11 +865,15 @@ namespace VbaGitTool
         private GroupBox grpSetup;
         private TextBox txtLog;
         private HelpForm _helpForm;
+        private Label lblHistNote;      // 履歴一覧の使い方の説明
+        private Label lblHistDetail;    // 選択した履歴で変わったモジュール
+        private ToolTip _tip;
 
         private class HistoryItem
         {
             public string Hash;
             public string Display;
+            public string Detail;
             public override string ToString() { return Display; }
         }
 
@@ -800,6 +982,8 @@ namespace VbaGitTool
 
             pnlTop.Controls.AddRange(new Control[] { lblTargetDir, lblGitInfo, btnChangeDir, btnHelp });
 
+            _tip = new ToolTip();
+
             // Group 1: 日常のセーブ・GitHub同期
             grpSave = new GroupBox { Text = "1. 日常のセーブ・GitHub同期" };
             lblMsg = new Label { Text = "コミットメモ:", AutoSize = true };
@@ -821,11 +1005,23 @@ namespace VbaGitTool
             // Group 2: 取得・復元（やり直し）
             grpRestore = new GroupBox { Text = "2. 取得・復元（やり直し） ※Excelを閉じてから実行" };
             lblHist = new Label { Text = "過去の履歴・タグ一覧（選択して復元 or タグ付け）:", AutoSize = true };
+            lblHistNote = new Label
+            {
+                Text = "※履歴を選択すると、その時に変更になったモジュール名がボックスの下に表示されます。",
+                AutoSize = false,
+                AutoEllipsis = true,
+                Font = new Font("Yu Gothic UI", 8.5f, FontStyle.Regular),
+                ForeColor = Color.FromArgb(90, 90, 90),
+                TextAlign = ContentAlignment.MiddleLeft
+            };
+            _tip.SetToolTip(lblHistNote, lblHistNote.Text);
 
             btnRefreshHist = CreateStyledButton("履歴再読込", BgBlue, FgBlue, false);
             btnRefreshHist.Click += async (s, e) => await RunOperationAsync(() => RefreshHistoryListAsync());
 
             lstHistory = new ListBox { Font = new Font("Consolas", 9.5f), HorizontalScrollbar = true, IntegralHeight = false };
+            lstHistory.SelectedIndexChanged += (s, e) => UpdateHistoryDetail();
+            lblHistDetail = new Label { AutoSize = false, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Color.FromArgb(70, 70, 70) };
 
             btnRestoreLocal = CreateStyledButton("選択した履歴へ復元 (ローカル)", BgBlue, FgBlue, true);
             btnRestoreLocal.Click += async (s, e) => await RunOperationAsync(() => ExecuteRestoreSelectedAsync(false));
@@ -842,7 +1038,7 @@ namespace VbaGitTool
             btnAddTag = CreateStyledButton("選択履歴にタグ付与", BgWhite, FgBlack, false);
             btnAddTag.Click += async (s, e) => await RunOperationAsync(() => ExecuteTagSelectedAsync());
 
-            grpRestore.Controls.AddRange(new Control[] { lblHist, btnRefreshHist, lstHistory, btnRestoreLocal, btnRestoreLatest, btnPull, btnRestoreGithub, btnAddTag });
+            grpRestore.Controls.AddRange(new Control[] { lblHist, lblHistNote, btnRefreshHist, lstHistory, lblHistDetail, btnRestoreLocal, btnRestoreLatest, btnPull, btnRestoreGithub, btnAddTag });
 
             // Group 3: 新規構築・初期設定・メンテナンス
             grpSetup = new GroupBox { Text = "3. 新規構築・初期設定・メンテナンス" };
@@ -950,7 +1146,7 @@ namespace VbaGitTool
             int logHeaderH = smallBtnH + 6;
             int usedFixedH = grp1Y + grp1H + 8 + grp3H + 8 + logHeaderH + pad;
             int availFlexH = Math.Max(220, ch - usedFixedH);
-            int grp2H = Math.Max(fh * 10, (int)(availFlexH * 0.58));
+            int grp2H = Math.Max(fh * 12, (int)(availFlexH * 0.62));
 
             int grp2Y = grpSave.Bottom + 8;
             grpRestore.Bounds = new Rectangle(pad, grp2Y, grpW, grp2H);
@@ -958,8 +1154,17 @@ namespace VbaGitTool
             // Group 2 内部
             int rHeaderY = fh + 6;
             int refW = MeasureButtonWidth(btnRefreshHist, 24);
-            btnRefreshHist.Bounds = new Rectangle(grpW - innerPad - refW, rHeaderY, refW, smallBtnH);
-            lblHist.Location = new Point(innerPad, rHeaderY + (smallBtnH - fh) / 2);
+            int noteFh = lblHistNote.Font.Height;
+            int hdrH = Math.Max(smallBtnH, noteFh * 2 + 2);   // 説明文は2行まで
+            btnRefreshHist.Bounds = new Rectangle(grpW - innerPad - refW, rHeaderY + (hdrH - smallBtnH) / 2, refW, smallBtnH);
+            lblHist.Location = new Point(innerPad, rHeaderY + (hdrH - fh) / 2);
+
+            // 一覧の見出しの右側の空きに、使い方の説明を置く（幅が足りなければ2行に折り返す）
+            int lblHistW = TextRenderer.MeasureText(lblHist.Text, lblHist.Font).Width;
+            int noteX = innerPad + lblHistW + 14;
+            int noteW = btnRefreshHist.Left - 12 - noteX;
+            lblHistNote.Visible = noteW >= 120;
+            lblHistNote.Bounds = new Rectangle(noteX, rHeaderY, Math.Max(noteW, 0), hdrH);
 
             int rBotRowY = grp2H - 12 - btnH;
             int rMidRowY = rBotRowY - 8 - btnH;
@@ -980,9 +1185,11 @@ namespace VbaGitTool
             btnAddTag.Bounds = new Rectangle(btnRestoreGithub.Right + gap, rBotRowY, ws3, btnH);
 
             // 履歴リストボックス
-            int lstTop = btnRefreshHist.Bottom + 6;
-            int lstH = Math.Max(40, rMidRowY - 8 - lstTop);
+            int detailH = fh + 6;
+            int lstTop = rHeaderY + hdrH + 6;
+            int lstH = Math.Max(40, rMidRowY - 8 - lstTop - detailH);
             lstHistory.Bounds = new Rectangle(innerPad, lstTop, innerW, lstH);
+            lblHistDetail.Bounds = new Rectangle(innerPad, lstHistory.Bottom + 2, innerW, detailH);
 
             // 5. Group 3 (Setup)
             int grp3Y = grpRestore.Bottom + 8;
@@ -1534,6 +1741,9 @@ namespace VbaGitTool
                 return;
             }
 
+            // Excelに保存していない変更があれば、先に保存するか確認する
+            if (!PrepareExcelBeforeSave(dir)) return;
+
             AppendLog("========== Save 処理開始 ==========");
             if (!await RunVbacAsync(dir, "decombine"))
             {
@@ -1600,7 +1810,7 @@ namespace VbaGitTool
             }
             else
             {
-                AppendLog("[案内] 前回セーブからコードの変更点がないため、新規コミットはスキップされました。");
+                AppendLog("[案内] 前回セーブからコードの変更点がないため、新規コミットはスキップされました（ブックのバックアップも作成しません）。");
             }
 
             if (tag.Length > 0)
@@ -2104,17 +2314,193 @@ namespace VbaGitTool
         private async Task RefreshHistoryListAsync()
         {
             lstHistory.Items.Clear();
-            var res = await _cmd.GitAsync(_targetDir, true, "log", "-n", "30", "--date=short", "--pretty=format:%h%x1f%ad%x1f%d%x1f%s");
-            if (!res.Success || string.IsNullOrWhiteSpace(res.Output)) return;
 
-            var lines = res.Output.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
-            foreach (string line in lines)
+            // 変更ファイル一覧つきで取得する。各履歴の先頭に区切り(0x1e)を付けて分割する。
+            var res = await _cmd.GitAsync(_targetDir, true, "log", "-n", "30", "--date=short", "--no-renames", "--name-status",
+                "--pretty=format:%x1e%h%x1f%ad%x1f%d%x1f%s%x1f%p");
+            if (res.Success && !string.IsNullOrWhiteSpace(res.Output))
             {
-                string[] p = line.Split('\u001f');
-                if (p.Length < 4 || !Validation.IsValidCommitHash(p[0])) continue;
-                string deco = p[2].Trim();
-                string display = p[0] + "  " + p[1] + "  " + (deco.Length > 0 ? deco + " " : "") + p[3];
-                lstHistory.Items.Add(new HistoryItem { Hash = p[0], Display = display });
+                string[] records = res.Output.Split(new[] { '\u001e' }, StringSplitOptions.RemoveEmptyEntries);
+                foreach (string rec in records)
+                {
+                    string[] lines = rec.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+                    string[] p = lines[0].Split('\u001f');
+                    if (p.Length < 5 || !Validation.IsValidCommitHash(p[0])) continue;
+
+                    bool isRoot = p[4].Trim().Length == 0;   // 親がない = 最初の記録
+                    var statusLines = new List<string>();
+                    for (int i = 1; i < lines.Length; i++)
+                    {
+                        if (lines[i].Trim().Length > 0) statusLines.Add(lines[i]);
+                    }
+
+                    string shortText, detail;
+                    BuildChangeInfo(statusLines, isRoot, out shortText, out detail);
+
+                    string deco = p[2].Trim();
+                    string display = p[0] + "  " + p[1] + "  " + (deco.Length > 0 ? deco + " " : "") + p[3] + "  " + shortText;
+                    lstHistory.Items.Add(new HistoryItem { Hash = p[0], Display = display, Detail = detail });
+                }
+            }
+            UpdateHistoryDetail();
+        }
+
+        /// <summary>git log --name-status の行から、src 配下のモジュール単位の変更内容を作る。</summary>
+        private static void BuildChangeInfo(List<string> statusLines, bool isRoot, out string shortText, out string detail)
+        {
+            // モジュール名 → 変更種別 (A=追加 / D=削除 / M=変更)
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string line in statusLines)
+            {
+                string[] parts = line.Split('\t');
+                if (parts.Length < 2 || parts[0].Length == 0) continue;
+
+                string st = parts[0].Substring(0, 1);
+                string path = parts[parts.Length - 1].Replace('\\', '/');
+                if (!path.StartsWith("src/", StringComparison.OrdinalIgnoreCase)) continue;
+
+                string file = path.Substring(path.LastIndexOf('/') + 1);
+                string mod = Path.GetFileNameWithoutExtension(file);   // .frm と .frx は同じ名前なので1つにまとまる
+                if (mod.Length == 0) continue;
+
+                if (st != "A" && st != "D") st = "M";
+
+                string cur;
+                if (!map.TryGetValue(mod, out cur)) map[mod] = st;
+                else if (cur != st) map[mod] = (cur == "A" || st == "A") ? "A" : "M";
+            }
+
+            List<string> added = map.Where(kv => kv.Value == "A").Select(kv => kv.Key).OrderBy(x => x).ToList();
+            List<string> deleted = map.Where(kv => kv.Value == "D").Select(kv => kv.Key).OrderBy(x => x).ToList();
+            List<string> modified = map.Where(kv => kv.Value == "M").Select(kv => kv.Key).OrderBy(x => x).ToList();
+            int total = map.Count;
+
+            if (isRoot)
+            {
+                shortText = total > 0 ? "〔最初の記録・全" + total + "件〕" : "〔最初の記録〕";
+                detail = total > 0
+                    ? "最初の記録（全" + total + "件）: " + string.Join(", ", map.Keys.OrderBy(x => x).ToArray())
+                    : "最初の記録です。";
+                return;
+            }
+
+            if (total == 0)
+            {
+                shortText = "〔VBA変更なし〕";
+                detail = "VBAコード(src)の変更はありません（設定ファイルなどの変更のみ）。";
+                return;
+            }
+
+            shortText = "〔" + total + "件〕";
+            var parts2 = new List<string>();
+            if (modified.Count > 0) parts2.Add("変更: " + string.Join(", ", modified.ToArray()));
+            if (added.Count > 0) parts2.Add("追加: " + string.Join(", ", added.ToArray()));
+            if (deleted.Count > 0) parts2.Add("削除: " + string.Join(", ", deleted.ToArray()));
+            detail = string.Join(" / ", parts2.ToArray());
+        }
+
+        private void UpdateHistoryDetail()
+        {
+            var it = lstHistory.SelectedItem as HistoryItem;
+            string text = it == null
+                ? "履歴の行を選ぶと、変更されたモジュール名がここに表示されます。"
+                : it.Detail;
+            lblHistDetail.Text = text;
+            _tip.SetToolTip(lblHistDetail, text);
+        }
+
+        // ---------------------------------------------------------------------
+        // Save前のExcel保存確認
+        // ---------------------------------------------------------------------
+        /// <summary>
+        /// Excelに保存していない変更があれば、ツールから上書き保存するか確認する。
+        /// Save を続けてよければ true、中止なら false。
+        /// </summary>
+        private bool PrepareExcelBeforeSave(string dir)
+        {
+            string binDir = Path.Combine(dir, "bin");
+            if (!Directory.Exists(binDir)) return true;
+
+            List<OpenWorkbook> open = null;
+            try
+            {
+                open = ExcelBridge.FindOpenWorkbooks(binDir, AppendLog);
+
+                List<OpenWorkbook> unreadable = open.Where(w => w.Unreadable).ToList();
+                List<OpenWorkbook> dirty = open.Where(w => !w.Unreadable && !w.Saved).ToList();
+
+                if (unreadable.Count > 0)
+                {
+                    string names = string.Join("\n", unreadable.Select(w => "　・" + w.Name).ToArray());
+                    var r = MessageBox.Show(
+                        "Excelが入力中、またはメッセージを表示中のため、次のブックに保存していない変更があるか確認できません。\n\n" +
+                        names + "\n\n" +
+                        "Excelに戻り、セルの入力を確定（Enterキー）するか、表示中のメッセージを閉じてから、\n" +
+                        "もう一度 Save してください。\n\n" +
+                        "確認せずに、このまま Save を続けますか？\n" +
+                        "（Excelに保存していない変更があっても、記録されません）\n\n" +
+                        "[はい]　このまま続ける　　[いいえ]　中止してExcelに戻る",
+                        "Excelの状態を確認できません",
+                        MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+                    if (r != DialogResult.Yes)
+                    {
+                        AppendLog("[案内] Save を中止しました。Excelでの操作を終えてから、もう一度 Save してください。");
+                        return false;
+                    }
+                }
+
+                if (dirty.Count > 0)
+                {
+                    string names = string.Join("\n", dirty.Select(w => "　・" + w.Name).ToArray());
+                    var r = MessageBox.Show(
+                        "次のExcelブックに、保存していない変更があります。\n\n" + names + "\n\n" +
+                        "Save の前に、ツールから上書き保存しますか？\n\n" +
+                        "[はい]　保存してから Save を続ける\n" +
+                        "[いいえ]　保存せず、今ディスクにある状態で Save を続ける\n" +
+                        "[キャンセル]　Save を中止する\n\n" +
+                        "※試しに書き換えただけの内容が残っている場合は、「いいえ」か「キャンセル」を選んでください。\n" +
+                        "※何も編集していないのに表示される場合は、ブック内の再計算される関数（NOW など）が原因のことがあります。",
+                        "Excelに保存していない変更があります",
+                        MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question, MessageBoxDefaultButton.Button1);
+
+                    if (r == DialogResult.Cancel)
+                    {
+                        AppendLog("[案内] Save を中止しました。");
+                        return false;
+                    }
+
+                    if (r == DialogResult.Yes)
+                    {
+                        foreach (OpenWorkbook w in dirty)
+                        {
+                            string err;
+                            if (!ExcelBridge.TrySave(w, out err))
+                            {
+                                AppendLog("[エラー] Excelブックを保存できませんでした: " + w.Name + " (" + err + ")");
+                                MessageBox.Show(
+                                    "Excelブックを保存できませんでした:\n" + w.Name + "\n\n" + err + "\n\n" +
+                                    "Save を中止します。Excelで直接保存してから、もう一度 Save してください。",
+                                    "保存できません", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                                return false;
+                            }
+                            AppendLog("・Excelブックを保存しました: " + w.Name);
+                        }
+                    }
+                    else
+                    {
+                        AppendLog("[案内] Excelで保存していない変更は記録されません（ディスク上の状態で Save します）。");
+                    }
+                }
+                else if (open.Count == 0 && Directory.GetFiles(binDir, "~$*").Length > 0)
+                {
+                    AppendLog("[案内] Excelでブックが開かれています。ツールから保存状態を確認できなかったため、Ctrl+S で上書き保存してあることを確認してください。");
+                }
+
+                return true;
+            }
+            finally
+            {
+                ExcelBridge.Release(open);
             }
         }
 
@@ -2285,6 +2671,7 @@ namespace VbaGitTool
                 "   ・PC内だけ（ローカル）に保存 → [Save (ローカル保存のみ)]\r\n" +
                 "   ・GitHubにも送る（バックアップ） → [Save ＆ GitHub送信 (一括)]\r\n\r\n" +
                 "※初めて Save するときだけ、「記録者の登録」画面が表示されます（お名前を1度登録すれば次回から不要です）。\r\n" +
+                "※Excelに保存していない変更が残っているときは、Save の前に「保存してから Save しますか？」と確認が出ます。\r\n" +
                 "※抽出されたVBAコードを格納する src フォルダは、誤編集防止のため自動的に「隠しフォルダ」として保護されます。\r\n" +
                 "※Save のたびに、binフォルダ内のExcelブック本体が backup フォルダへコピーされます。\r\n" +
                 "   名前の末尾に Save の日時が付きます（例: 給油集計表_11.16_0902.xlsm ＝ 11月16日 9:02）。\r\n" +
@@ -2326,6 +2713,8 @@ namespace VbaGitTool
                 "  万一おかしくなった場合は、そこから手動で戻せます。\r\n\r\n" +
                 "■ パターンA：昨日や先週など、特定の履歴・タグ時点に戻したい（最も使う復元）\r\n" +
                 "  1.「過去の履歴・タグ一覧」から戻りたい行をクリックして選択します。\r\n" +
+                "     （行を選ぶと、一覧の下に「そのSaveで変わったモジュール」が表示されます。\r\n" +
+                "      行末の〔3件〕は、変更されたモジュールの数です）\r\n" +
                 "  2. [選択した履歴へ復元 (ローカル)] を押します（GitHub上の履歴を使う場合は [GitHub取得後]）。\r\n" +
                 "  3. Excelを開いて動作を確認し、その状態を新しい最新版として確定させる場合は\r\n" +
                 "     再度 [Save]（または GitHub送信）を押してください。\r\n\r\n" +
@@ -2370,6 +2759,13 @@ namespace VbaGitTool
                 "  Save時のブック本体のコピー（ブック名_月.日_時分.xlsm など）と、復元・Pull前の退避\r\n" +
                 "  （restore_日時 フォルダ）を保存した backup フォルダを開きます。\r\n" +
                 "  ブック本体はブックごとに最新10回分、退避は最新10回分を保持します。\r\n\r\n" +
+                "・Save前のExcel保存確認\r\n" +
+                "  Excelに保存していない変更があるとき、Save の前に「保存してから Save しますか？」と確認します。\r\n" +
+                "  Excelがセル入力中などで状態を確認できないときは、その旨を案内します\r\n" +
+                "  （Enterキーで入力を確定してから、もう一度 Save してください）。\r\n\r\n" +
+                "・履歴一覧の〔N件〕と、変更モジュールの表示\r\n" +
+                "  各履歴で変更されたモジュール（標準モジュール・クラス・フォーム・シートなど）の数です。\r\n" +
+                "  行を選ぶと、一覧の下に「変更／追加／削除」されたモジュール名が表示されます。\r\n\r\n" +
                 "・親フォルダ自動補正 ＆ srcフォルダ隠し属性保護\r\n" +
                 "  bin フォルダ内で起動しても1階層上の親フォルダを自動認識し、src フォルダは隠し属性で保護します。\r\n\r\n" +
                 "・Excel使用中警告 ＆ 自動退避（安全装置）\r\n" +
