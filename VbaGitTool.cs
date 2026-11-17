@@ -1,4 +1,5 @@
-// VBA Git 管理ツール 最終完成版 (srcフォルダ自動隠し属性対応・ローカル管理特化版)　2026年11月16日
+// VBA Git 管理ツール 最終完成版 (srcフォルダ自動隠し属性対応・ローカル管理特化版)　2026年11月17日 更新
+// 追加: コミットメモ確認＋日時付与 / 記録者(user.name・email)の初回登録 / Save時のブック世代バックアップ(backupフォルダ)
 // ビルド例 (C# 5 互換 / .NET Framework 4.x):
 //   csc /target:winexe /out:VbaGitTool.exe VbaGitTool.cs /r:System.Windows.Forms.dll /r:System.Drawing.dll
 
@@ -256,8 +257,18 @@ namespace VbaGitTool
     // =========================================================================
     public static class ProjectFiles
     {
-        public static readonly string[] DefaultIgnoreLines = { "bin/*", "!bin/.gitkeep", "~$*" };
-        private const int KeepBackups = 10;
+        // backup/ は Git に入れない（ブックのコピーが履歴に紛れ込むのを防ぐ）
+        public static readonly string[] DefaultIgnoreLines = { "bin/*", "!bin/.gitkeep", "~$*", "backup/" };
+
+        public const string BackupFolderName = "backup";
+        private const string SavePrefix = "save_";         // Save時のブック本体コピー
+        private const string RestorePrefix = "restore_";   // 復元・Pull直前の src/bin 退避
+        private const int KeepSaveBackups = 10;
+        private const int KeepRestoreBackups = 10;
+        public const long BackupWarnBytes = 1024L * 1024L * 1024L;   // 合計1GBで警告
+
+        private static readonly string[] WorkbookExtensions =
+            { ".xls", ".xlsx", ".xlsm", ".xlsb", ".xlam", ".xla", ".xltm", ".xltx", ".xlt" };
 
         /// <summary>
         /// 指定フォルダ（カレント）と1階層上の親フォルダを確認し、
@@ -329,6 +340,78 @@ namespace VbaGitTool
             catch { }
         }
 
+        // ---------------------------------------------------------------------
+        // backup フォルダ
+        // ---------------------------------------------------------------------
+        public static string GetBackupRoot(string dir)
+        {
+            return Path.Combine(dir, BackupFolderName);
+        }
+
+        private static void EnsureBackupReadme(string root)
+        {
+            try
+            {
+                string readme = Path.Combine(root, "README.txt");
+                if (File.Exists(readme)) return;
+
+                string text =
+                    "このフォルダは「VBA Git 管理ツール」が自動で作るバックアップ置き場です。\r\n" +
+                    "（Gitの履歴には含まれません。フォルダごと別の場所へコピーしても構いません）\r\n\r\n" +
+                    "■ save_日時_コミットID\r\n" +
+                    "  「Save」を実行するたびに作られる、Excelブック本体のコピーです（シートの内容も含みます）。\r\n" +
+                    "  Gitの履歴にはVBAコードしか記録されないため、シートのデータや書式を\r\n" +
+                    "  昔の状態に戻したいときに使います。\r\n" +
+                    "  使い方: フォルダ内のブックを開き、必要なシートやセルを今のブックへコピーしてください。\r\n" +
+                    "  日時とコミットIDは、ツールの「過去の履歴」一覧の行と見比べられます。\r\n" +
+                    "  最新10回分だけ保持されます（古いものは自動で削除されます）。\r\n\r\n" +
+                    "■ restore_日時\r\n" +
+                    "  「復元」「Pull」を実行する直前の、src フォルダと bin フォルダの退避です。\r\n" +
+                    "  操作をやり直したいときに使います。最新10回分だけ保持されます。\r\n";
+                File.WriteAllText(readme, text, new UTF8Encoding(true));
+            }
+            catch { }
+        }
+
+        private static void PruneBackups(string root, string prefix, int keep)
+        {
+            try
+            {
+                foreach (string old in Directory.GetDirectories(root, prefix + "*")
+                    .OrderByDescending(d => Path.GetFileName(d)).Skip(keep))
+                {
+                    try { Directory.Delete(old, true); } catch { }
+                }
+            }
+            catch { }
+        }
+
+        public static long GetDirectorySize(string path)
+        {
+            long total = 0;
+            try
+            {
+                foreach (string f in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
+                {
+                    try { total += new FileInfo(f).Length; } catch { }
+                }
+            }
+            catch { }
+            return total;
+        }
+
+        private static bool IsWorkbook(string path)
+        {
+            string name = Path.GetFileName(path);
+            if (name.StartsWith("~$")) return false;
+            string ext = Path.GetExtension(name);
+            return WorkbookExtensions.Any(e => e.Equals(ext, StringComparison.OrdinalIgnoreCase));
+        }
+
+        /// <summary>
+        /// 復元・Pull の直前に src と bin を backup\restore_日時 へ退避する。
+        /// 戻り値: 退避先パス / 退避対象なしなら "" / 失敗なら null
+        /// </summary>
         public static string BackupWorkingState(string dir, Action<string> log)
         {
             try
@@ -337,26 +420,75 @@ namespace VbaGitTool
                 string bin = Path.Combine(dir, "bin");
                 if (!Directory.Exists(src) && !Directory.Exists(bin)) return "";
 
-                string gitDir = Path.Combine(dir, ".git");
-                string root = Directory.Exists(gitDir)
-                    ? Path.Combine(gitDir, "vbagit_backup")
-                    : Path.Combine(Path.GetTempPath(), "vbagit_backup_" + Path.GetFileName(dir.TrimEnd('\\', '/')));
+                string root = GetBackupRoot(dir);
+                Directory.CreateDirectory(root);
+                EnsureBackupReadme(root);
 
-                string dest = Path.Combine(root, DateTime.Now.ToString("yyyyMMdd_HHmmss"));
+                string dest = Path.Combine(root, RestorePrefix + DateTime.Now.ToString("yyyyMMdd_HHmmss"));
                 Directory.CreateDirectory(dest);
 
                 if (Directory.Exists(src)) CopyDirectory(src, Path.Combine(dest, "src"));
                 if (Directory.Exists(bin)) CopyDirectory(bin, Path.Combine(dest, "bin"));
 
-                foreach (string old in Directory.GetDirectories(root).OrderByDescending(d => d).Skip(KeepBackups))
-                {
-                    try { Directory.Delete(old, true); } catch { }
-                }
+                PruneBackups(root, RestorePrefix, KeepRestoreBackups);
                 return dest;
             }
             catch (Exception ex)
             {
                 if (log != null) log("[警告] 退避に失敗しました: " + ex.Message);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Save でコミットが作られたとき、bin 内のExcelブック本体を backup\save_日時_コミットID へコピーする。
+        /// 戻り値: コピー先パス / 対象ブックなしなら "" / 失敗なら null
+        /// </summary>
+        public static string BackupWorkbooks(string dir, string shortHash, Action<string> log)
+        {
+            try
+            {
+                string bin = Path.Combine(dir, "bin");
+                if (!Directory.Exists(bin)) return "";
+
+                string[] files = Directory.GetFiles(bin).Where(f => IsWorkbook(f)).ToArray();
+                if (files.Length == 0) return "";
+
+                string root = GetBackupRoot(dir);
+                Directory.CreateDirectory(root);
+                EnsureBackupReadme(root);
+
+                string name = SavePrefix + DateTime.Now.ToString("yyyyMMdd_HHmmss")
+                    + (string.IsNullOrEmpty(shortHash) ? "" : "_" + shortHash);
+                string dest = Path.Combine(root, name);
+                Directory.CreateDirectory(dest);
+
+                int failed = 0;
+                foreach (string f in files)
+                {
+                    try
+                    {
+                        File.Copy(f, Path.Combine(dest, Path.GetFileName(f)), true);
+                    }
+                    catch (Exception ex)
+                    {
+                        failed++;
+                        if (log != null) log("[警告] ブックのコピーに失敗しました: " + Path.GetFileName(f) + " (" + ex.Message + ")");
+                    }
+                }
+
+                if (failed == files.Length)
+                {
+                    try { Directory.Delete(dest, true); } catch { }
+                    return null;
+                }
+
+                PruneBackups(root, SavePrefix, KeepSaveBackups);
+                return dest;
+            }
+            catch (Exception ex)
+            {
+                if (log != null) log("[警告] ブックのバックアップに失敗しました: " + ex.Message);
                 return null;
             }
         }
@@ -376,6 +508,9 @@ namespace VbaGitTool
             }
         }
 
+        // ---------------------------------------------------------------------
+        // .gitignore
+        // ---------------------------------------------------------------------
         public static void EnsureDefaultGitignore(string dir)
         {
             string path = Path.Combine(dir, ".gitignore");
@@ -402,6 +537,40 @@ namespace VbaGitTool
             if (!File.Exists(path)) return false;
             var accepted = new[] { "bin", "bin/", "bin/*", "/bin", "/bin/", "/bin/*" };
             return File.ReadAllLines(path, Encoding.UTF8).Any(l => accepted.Contains(l.Trim()));
+        }
+
+        public static bool GitignoreCoversBackup(string dir)
+        {
+            string path = Path.Combine(dir, ".gitignore");
+            if (!File.Exists(path)) return false;
+            var accepted = new[] { "backup", "backup/", "backup/*", "/backup", "/backup/", "/backup/*" };
+            return File.ReadAllLines(path, Encoding.UTF8).Any(l => accepted.Contains(l.Trim()));
+        }
+
+        /// <summary>
+        /// .gitignore に backup/ が無ければ追記する（他の行は変更しない）。
+        /// 追記した場合は true。
+        /// </summary>
+        public static bool EnsureBackupIgnored(string dir)
+        {
+            try
+            {
+                if (GitignoreCoversBackup(dir)) return false;
+
+                string path = Path.Combine(dir, ".gitignore");
+                var lines = new List<string>();
+                if (File.Exists(path))
+                {
+                    lines.AddRange(File.ReadAllLines(path, Encoding.UTF8).Select(l => l.TrimEnd()));
+                }
+                lines.Add("backup/");
+                File.WriteAllText(path, string.Join("\r\n", lines.Where(l => l.Length > 0).ToArray()) + "\r\n", new UTF8Encoding(false));
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
     }
 
@@ -454,6 +623,7 @@ namespace VbaGitTool
         private Button btnCloneNew;
         private Button btnInitProject;
         private Button btnToggleReg;
+        private Button btnOpenBackup;
         private Button btnChangeDir;
         private Button btnHelp;
         private GroupBox grpSave;
@@ -634,6 +804,10 @@ namespace VbaGitTool
 
             // 4. 実行ログ
             lblLog = new Label { Text = "実行ログ:", AutoSize = true };
+
+            btnOpenBackup = CreateStyledButton("バックアップフォルダを開く", BgBlue, FgBlue, false);
+            btnOpenBackup.Click += (s, e) => OpenBackupFolder();
+
             btnToggleReg = CreateStyledButton("右クリックメニュー登録済み (解除する)", BgWhite, FgBlack, false);
             btnToggleReg.Click += (s, e) => ToggleContextMenuRegistration();
 
@@ -647,7 +821,7 @@ namespace VbaGitTool
                 Font = new Font("Consolas", 9.5f)
             };
 
-            this.Controls.AddRange(new Control[] { pnlTop, grpSave, grpRestore, grpSetup, lblLog, btnToggleReg, txtLog });
+            this.Controls.AddRange(new Control[] { pnlTop, grpSave, grpRestore, grpSetup, lblLog, btnOpenBackup, btnToggleReg, txtLog });
             ApplyResponsiveLayout();
         }
 
@@ -765,6 +939,8 @@ namespace VbaGitTool
             int logHeaderY = grpSetup.Bottom + 8;
             int regW = MeasureButtonWidth(btnToggleReg, 28);
             btnToggleReg.Bounds = new Rectangle(cw - pad - regW, logHeaderY, regW, smallBtnH);
+            int bkW = MeasureButtonWidth(btnOpenBackup, 28);
+            btnOpenBackup.Bounds = new Rectangle(btnToggleReg.Left - 8 - bkW, logHeaderY, bkW, smallBtnH);
             lblLog.Location = new Point(pad + 2, logHeaderY + (smallBtnH - fh) / 2);
 
             int txtLogTop = btnToggleReg.Bottom + 6;
@@ -940,6 +1116,7 @@ namespace VbaGitTool
             btnAddTag.Enabled = isGitRepo;
             btnRefreshHist.Enabled = isGitRepo;
             btnInitProject.Enabled = isGitRepo;
+            btnOpenBackup.Enabled = isGitRepo;
 
             btnSaveAndPush.Enabled = isGitRepo && canSync;
             btnPushOnly.Enabled = isGitRepo && canSync;
@@ -965,6 +1142,26 @@ namespace VbaGitTool
                     }
                     var ignored = RunOperationAsync(() => Task.FromResult(0));
                 }
+            }
+        }
+
+        private void OpenBackupFolder()
+        {
+            string path = ProjectFiles.GetBackupRoot(_targetDir);
+            if (!Directory.Exists(path))
+            {
+                MessageBox.Show("まだバックアップがありません。\nSave を実行すると、Excelブックのコピーがここに作られます。\n\n保存先: " + path,
+                    "バックアップなし", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            try
+            {
+                Process.Start(new ProcessStartInfo { FileName = path, UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("フォルダを開けませんでした:\n" + ex.Message, "エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
@@ -1029,6 +1226,7 @@ namespace VbaGitTool
             }
         }
 
+        /// <summary>復元・Pull の直前に src と bin を backup\restore_日時 へ退避する。続行してよければ true。</summary>
         private async Task<bool> BackupBeforeOverwriteAsync(string dir)
         {
             string path = await Task.Run(() => ProjectFiles.BackupWorkingState(dir, AppendLog));
@@ -1039,6 +1237,32 @@ namespace VbaGitTool
             }
             if (path.Length > 0) AppendLog("・安全のため現在の状態を退避しました: " + path);
             return true;
+        }
+
+        /// <summary>Save でコミットが作られた直後に、bin内のExcelブック本体を backup\save_日時_コミットID へコピーする。</summary>
+        private async Task BackupWorkbooksAfterCommitAsync(string dir)
+        {
+            var h = await _cmd.GitAsync(dir, true, "rev-parse", "--short", "HEAD");
+            string hash = h.Success ? h.Output.Trim() : "";
+            if (!Validation.IsValidCommitHash(hash)) hash = "";
+
+            string path = await Task.Run(() => ProjectFiles.BackupWorkbooks(dir, hash, AppendLog));
+            if (path == null)
+            {
+                AppendLog("[警告] ブックのバックアップに失敗しました（Save 自体は成功しています）。");
+                return;
+            }
+            if (path.Length == 0) return;
+
+            AppendLog("・ブック本体をバックアップしました: " + path);
+
+            long size = await Task.Run(() => ProjectFiles.GetDirectorySize(ProjectFiles.GetBackupRoot(dir)));
+            if (size > ProjectFiles.BackupWarnBytes)
+            {
+                AppendLog(string.Format("[警告] backup フォルダの合計が約 {0} MB になりました。ブックのサイズが大きいため、容量を多く使っています。",
+                    size / 1024 / 1024));
+                AppendLog("  不要な古いフォルダは「バックアップフォルダを開く」から手動で削除してください。");
+            }
         }
 
         private async Task<bool> IsValidTagNameAsync(string dir, string tag)
@@ -1055,6 +1279,157 @@ namespace VbaGitTool
         }
 
         // ---------------------------------------------------------------------
+        // 記録者（user.name / user.email）の初回登録
+        // ---------------------------------------------------------------------
+        /// <summary>
+        /// コミット・タグを作る直前に呼ぶ。未設定なら登録ダイアログを出す。
+        /// 設定済み、または登録できたら true。キャンセル・失敗なら false。
+        /// </summary>
+        private async Task<bool> EnsureGitIdentityAsync(string dir)
+        {
+            var n = await _cmd.GitAsync(dir, true, "config", "user.name");
+            var m = await _cmd.GitAsync(dir, true, "config", "user.email");
+            bool hasName = n.Success && !string.IsNullOrWhiteSpace(n.Output);
+            bool hasMail = m.Success && !string.IsNullOrWhiteSpace(m.Output);
+            if (hasName && hasMail) return true;
+
+            string[] input = PromptGitIdentity(hasName ? n.Output.Trim() : "", hasMail ? m.Output.Trim() : "");
+            if (input == null) return false;
+
+            // このPC共通の設定として保存（次回以降は聞かれない）。書けなければこのプロジェクトだけに保存。
+            var r1 = await _cmd.GitAsync(dir, true, "config", "--global", "user.name", input[0]);
+            var r2 = await _cmd.GitAsync(dir, true, "config", "--global", "user.email", input[1]);
+            if (!r1.Success || !r2.Success)
+            {
+                r1 = await _cmd.GitAsync(dir, true, "config", "--local", "user.name", input[0]);
+                r2 = await _cmd.GitAsync(dir, true, "config", "--local", "user.email", input[1]);
+            }
+
+            if (!r1.Success || !r2.Success)
+            {
+                AppendLog("[エラー] 記録者の登録に失敗しました。");
+                return false;
+            }
+
+            AppendLog("・記録者を登録しました: " + input[0] + " <" + input[1] + ">");
+            return true;
+        }
+
+        private string[] PromptGitIdentity(string defName, string defMail)
+        {
+            using (Form f = new Form())
+            {
+                f.AutoScaleMode = AutoScaleMode.None;
+                f.Font = this.Font;
+                int fh = this.Font.Height;
+                int W = Math.Max(600, fh * 34);
+                int labelMax = W - 32;
+
+                f.Text = "記録者の登録（初回のみ）";
+                f.FormBorderStyle = FormBorderStyle.FixedDialog;
+                f.MaximizeBox = false;
+                f.MinimizeBox = false;
+                f.StartPosition = FormStartPosition.CenterParent;
+
+                var tlp = new TableLayoutPanel
+                {
+                    Dock = DockStyle.Top,
+                    AutoSize = true,
+                    ColumnCount = 1,
+                    Padding = new Padding(14),
+                    Width = W
+                };
+                tlp.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+
+                var lblInfo = new Label
+                {
+                    Text = "履歴には「誰が記録したか」が名前として残ります。\n最初に1度だけ登録してください（このPCの設定として保存され、次回からは聞かれません）。\n\n" +
+                           "登録した名前は、履歴を GitHub へ送信した場合、GitHub上でも見える情報になります。",
+                    AutoSize = true,
+                    MaximumSize = new Size(labelMax, 0),
+                    Margin = new Padding(0, 0, 0, 12)
+                };
+
+                var lblName = new Label { Text = "記録者名（必須）:", AutoSize = true, Margin = new Padding(0, 0, 0, 2) };
+                var txtName = new TextBox { Text = defName, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 10) };
+
+                var lblMail = new Label { Text = "メールアドレス（任意）:", AutoSize = true, Margin = new Padding(0, 0, 0, 2) };
+                var txtMail = new TextBox { Text = defMail, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 6) };
+
+                var lblNote = new Label
+                {
+                    Text = "※空欄のままにすると、仮のアドレス（noreply@local）が記録されます。\n" +
+                           "　GitHubで自分の履歴として表示させたい場合は、GitHubに登録している実際のメールアドレスを入力してください。",
+                    AutoSize = true,
+                    MaximumSize = new Size(labelMax, 0),
+                    ForeColor = Color.FromArgb(90, 90, 90),
+                    Margin = new Padding(0, 0, 0, 12)
+                };
+
+                var pnlBtns = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, AutoSize = true, Margin = new Padding(0) };
+                var cancel = new Button { Text = "キャンセル", AutoSize = true, Padding = new Padding(10, 3, 10, 3), DialogResult = DialogResult.Cancel };
+                var ok = new Button
+                {
+                    Text = "登録して続ける",
+                    AutoSize = true,
+                    Padding = new Padding(14, 3, 14, 3),
+                    BackColor = BgBlue,
+                    ForeColor = FgBlue,
+                    Margin = new Padding(0, 0, 8, 0)
+                };
+                ok.Click += (s, e) =>
+                {
+                    string nm = txtName.Text.Trim();
+                    string ml = txtMail.Text.Trim();
+
+                    if (nm.Length == 0)
+                    {
+                        MessageBox.Show("記録者名を入力してください。", "入力エラー", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        txtName.Focus();
+                        return;
+                    }
+                    if (nm.IndexOfAny(new[] { '<', '>', '\r', '\n' }) >= 0)
+                    {
+                        MessageBox.Show("記録者名に使用できない文字（< > や改行）が含まれています。", "入力エラー", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        txtName.Focus();
+                        return;
+                    }
+                    if (ml.Length > 0 && (ml.IndexOf('@') < 1 || ml.Any(c => char.IsWhiteSpace(c) || c == '<' || c == '>')))
+                    {
+                        MessageBox.Show("メールアドレスの形式が正しくありません。\n（空欄にすると仮のアドレスが使われます）", "入力エラー", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        txtMail.Focus();
+                        return;
+                    }
+                    f.DialogResult = DialogResult.OK;
+                };
+                pnlBtns.Controls.Add(cancel);
+                pnlBtns.Controls.Add(ok);
+
+                tlp.Controls.Add(lblInfo, 0, 0);
+                tlp.Controls.Add(lblName, 0, 1);
+                tlp.Controls.Add(txtName, 0, 2);
+                tlp.Controls.Add(lblMail, 0, 3);
+                tlp.Controls.Add(txtMail, 0, 4);
+                tlp.Controls.Add(lblNote, 0, 5);
+                tlp.Controls.Add(pnlBtns, 0, 6);
+
+                f.Controls.Add(tlp);
+                f.ClientSize = new Size(W, 200);
+                int h = tlp.GetPreferredSize(new Size(W, 0)).Height;
+                f.ClientSize = new Size(W, Math.Max(h, 200));
+                f.AcceptButton = ok;
+                f.CancelButton = cancel;
+
+                if (f.ShowDialog(this) != DialogResult.OK) return null;
+
+                string finalName = txtName.Text.Trim();
+                string finalMail = txtMail.Text.Trim();
+                if (finalMail.Length == 0) finalMail = "noreply@local";
+                return new[] { finalName, finalMail };
+            }
+        }
+
+        // ---------------------------------------------------------------------
         // 日常操作
         // ---------------------------------------------------------------------
         private bool ConfirmGitignoreBeforeSave(string dir)
@@ -1063,7 +1438,7 @@ namespace VbaGitTool
 
             var r = MessageBox.Show(
                 ".gitignore に bin/ の除外設定が見つかりません。\nこのまま Save すると、binフォルダ内のExcelブック(.xlsm等)がそのままGitに登録される可能性があります。\n\n" +
-                "[はい] 標準の除外設定（bin/* , ~$* ）を自動追加して続行\n" +
+                "[はい] 標準の除外設定（bin/* , ~$* , backup/ ）を自動追加して続行\n" +
                 "[いいえ] 除外設定なしで続行\n" +
                 "[キャンセル] Saveを中止",
                 "除外設定の確認", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning);
@@ -1083,6 +1458,12 @@ namespace VbaGitTool
             string dir = _targetDir;
 
             if (!ConfirmGitignoreBeforeSave(dir)) return;
+
+            // バックアップフォルダ(backup/)が Git に取り込まれないよう、必ず除外しておく
+            if (ProjectFiles.EnsureBackupIgnored(dir))
+            {
+                AppendLog("・.gitignore に backup/ を追加しました（ブックのバックアップを履歴に入れないため）。");
+            }
 
             string tag = txtTagName.Text.Trim();
             if (tag.Length > 0 && !await IsValidTagNameAsync(dir, tag))
@@ -1111,18 +1492,54 @@ namespace VbaGitTool
                 return;
             }
 
-            string msg = Validation.SanitizeMessage(txtCommitMsg.Text);
-            if (msg.Length == 0) msg = "作業セーブ (" + DateTime.Now.ToString("yyyy/MM/dd HH:mm") + ")";
+            // コミットメモ: 入力があれば「メモ (日時)」、空欄なら「作業セーブ (日時)」
+            string userMemo = Validation.SanitizeMessage(txtCommitMsg.Text);
+            string stamp = DateTime.Now.ToString("yyyy/MM/dd HH:mm");
+            string msg = userMemo.Length > 0
+                ? userMemo + " (" + stamp + ")"
+                : "作業セーブ (" + stamp + ")";
 
             if (await HasStagedChangesAsync(dir))
             {
+                // メモが空欄ならユーザーに確認する（変更がない場合は確認しない）
+                if (userMemo.Length == 0)
+                {
+                    var answer = MessageBox.Show(
+                        "コミットメモが入力されていません。\n\n" +
+                        "メモなしで Save すると、更新日時だけが記録されます。\n" +
+                        "あとで履歴から目的の状態を探しにくくなるため、\n" +
+                        "「何を変えたか」を一言入力しておくことをおすすめします。\n\n" +
+                        "メモなしで Save を続けますか？",
+                        "コミットメモの確認",
+                        MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Question,
+                        MessageBoxDefaultButton.Button2);   // 既定は「いいえ」
+
+                    if (answer != DialogResult.Yes)
+                    {
+                        AppendLog("[案内] Save を中止しました。コミットメモを入力してから、もう一度 Save してください。");
+                        txtCommitMsg.Focus();
+                        return;
+                    }
+                }
+
+                // 記録者が未設定なら、ここで初回登録
+                if (!await EnsureGitIdentityAsync(dir))
+                {
+                    AppendLog("[案内] 記録者が登録されなかったため、Save を中止しました。");
+                    return;
+                }
+
                 var commitRes = await _cmd.GitAsync(dir, false, "commit", "-m", msg);
                 if (!commitRes.Success)
                 {
-                    AppendLog("[エラー] コミットに失敗しました。user.name / user.email の設定、またはフックのエラーを確認してください。");
+                    AppendLog("[エラー] コミットに失敗しました。フックのエラーなどを確認してください。");
                     return;
                 }
                 txtCommitMsg.Clear();
+
+                // コミットが作られたときだけ、ブック本体をバックアップ
+                await BackupWorkbooksAfterCommitAsync(dir);
             }
             else
             {
@@ -1131,9 +1548,16 @@ namespace VbaGitTool
 
             if (tag.Length > 0)
             {
-                var tagRes = await _cmd.GitAsync(dir, false, "tag", "-a", tag, "-m", msg);
-                if (tagRes.Success) txtTagName.Clear();
-                else AppendLog("[エラー] タグの作成に失敗しました（同名タグが既に存在する可能性があります）。");
+                if (!await EnsureGitIdentityAsync(dir))
+                {
+                    AppendLog("[案内] 記録者が登録されなかったため、タグは作成しませんでした。");
+                }
+                else
+                {
+                    var tagRes = await _cmd.GitAsync(dir, false, "tag", "-a", tag, "-m", msg);
+                    if (tagRes.Success) txtTagName.Clear();
+                    else AppendLog("[エラー] タグの作成に失敗しました（同名タグが既に存在する可能性があります）。");
+                }
             }
 
             if (alsoPush)
@@ -1216,7 +1640,7 @@ namespace VbaGitTool
                 {
                     AppendLog("[エラー] src/ の復元に失敗しました。HEAD からの復旧を試みます...");
                     await _cmd.GitAsync(dir, false, "checkout", "HEAD", "--", "src");
-                    AppendLog("  退避フォルダ (.git\\vbagit_backup) に元の状態が残っています。");
+                    AppendLog("  backup フォルダ (restore_日時) に元の状態が残っています。");
                     return false;
                 }
                 return true;
@@ -1232,7 +1656,7 @@ namespace VbaGitTool
             string dir = _targetDir;
             if (IsExcelOpenInBin(dir)) return;
 
-            if (MessageBox.Show("直前に Save した状態へソースコードとExcelブックを巻き戻します。\n現在の未保存の編集内容は破棄されます\n（ただし実行前に .git\\vbagit_backup へ自動退避します）。\nよろしいですか？",
+            if (MessageBox.Show("直前に Save した状態へソースコードとExcelブックを巻き戻します。\n現在の未保存の編集内容は破棄されます\n（ただし実行前に backup フォルダへ自動退避します）。\nよろしいですか？",
                 "直前状態への復元確認", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
                 return;
 
@@ -1268,7 +1692,7 @@ namespace VbaGitTool
             string commitHash = item.Hash;
 
             string sourceLabel = fromGithub ? "GitHub(origin)を取得したうえで、履歴" : "ローカルの履歴";
-            if (MessageBox.Show(string.Format("{0} [{1}] の状態へ Excel ブックを復元します。\n現在の内容は .git\\vbagit_backup へ自動退避されます。\nよろしいですか？", sourceLabel, commitHash),
+            if (MessageBox.Show(string.Format("{0} [{1}] の状態へ Excel ブックを復元します。\n現在の内容は backup フォルダへ自動退避されます。\nよろしいですか？", sourceLabel, commitHash),
                 "過去履歴からの復元確認", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
                 return;
 
@@ -1334,6 +1758,12 @@ namespace VbaGitTool
             string tagMsg = PromptInput("タグのメモ", "タグの説明メモを入力してください:", "リリース版");
             tagMsg = string.IsNullOrWhiteSpace(tagMsg) ? tagName : Validation.SanitizeMessage(tagMsg);
 
+            if (!await EnsureGitIdentityAsync(dir))
+            {
+                AppendLog("[案内] 記録者が登録されなかったため、タグは付与しませんでした。");
+                return;
+            }
+
             var res = await _cmd.GitAsync(dir, false, "tag", "-a", tagName, commitHash, "-m", tagMsg);
             if (res.Success)
                 AppendLog(string.Format("完了: [{0}] にタグ '{1}' を付与しました。（GitHubへ送るには「GitHub送信のみ」を押してください）", commitHash, tagName));
@@ -1376,7 +1806,7 @@ namespace VbaGitTool
             await _cmd.GitAsync(newProjectPath, true, "symbolic-ref", "HEAD", "refs/heads/main");
 
             ProjectFiles.EnsureDefaultGitignore(newProjectPath);
-            AppendLog("・標準の .gitignore (bin/* , ~$*) と bin/.gitkeep を作成しました。");
+            AppendLog("・標準の .gitignore (bin/* , ~$* , backup/) と bin/.gitkeep を作成しました。");
 
             AppendLog("完了: ローカル専用のGit管理フォルダを作成しました！作業対象を切り替えます。");
             _targetDir = newProjectPath;
@@ -1551,6 +1981,12 @@ namespace VbaGitTool
             AppendLog("========== 初期設定・監視解除を実行 ==========");
             File.WriteAllText(gitignorePath, newText.TrimEnd() + "\r\n", new UTF8Encoding(false));
 
+            // backup/ の除外は常に維持する（ブックのバックアップを履歴に入れないため）
+            if (ProjectFiles.EnsureBackupIgnored(dir))
+            {
+                AppendLog("・backup/ の除外設定を維持しました（ブックのバックアップを履歴に入れないため）。");
+            }
+
             if (deleteTpl && File.Exists(tplPath))
             {
                 File.Delete(tplPath);
@@ -1575,9 +2011,16 @@ namespace VbaGitTool
             bool committed = false;
             if (await HasStagedChangesAsync(dir))
             {
-                var cm = await _cmd.GitAsync(dir, false, "commit", "-m", "プロジェクト用.gitignore設定および不要ファイルの管理除外");
-                committed = cm.Success;
-                if (!committed) AppendLog("[エラー] コミットに失敗しました。user.name / user.email の設定を確認してください。");
+                if (!await EnsureGitIdentityAsync(dir))
+                {
+                    AppendLog("[案内] 記録者が登録されなかったため、コミットは行いませんでした。");
+                }
+                else
+                {
+                    var cm = await _cmd.GitAsync(dir, false, "commit", "-m", "プロジェクト用.gitignore設定および不要ファイルの管理除外");
+                    committed = cm.Success;
+                    if (!committed) AppendLog("[エラー] コミットに失敗しました。");
+                }
             }
             else
             {
@@ -1779,11 +2222,15 @@ namespace VbaGitTool
                 "1. binフォルダ内のExcelでマクロを編集し、上書き保存（Ctrl + S）する\r\n\r\n" +
                 "2. 親フォルダ（または bin フォルダ内）を右クリック ＞「VBA Git 管理ツールを開く」\r\n\r\n" +
                 "3.「コミットメモ」に修正内容を入力する\r\n" +
-                "   （空欄のままでも自動で日時メモが入ります）\r\n\r\n" +
+                "   ・メモの後ろには、自動で日時が付きます\r\n" +
+                "   ・空欄のまま Save すると確認が表示されます（そのまま進むと「作業セーブ (日時)」で記録されます）\r\n\r\n" +
                 "4. タイミングに合わせてボタンを押す\r\n" +
                 "   ・PC内だけ（ローカル）に保存 → [Save (ローカル保存のみ)]\r\n" +
                 "   ・GitHubにも送る（バックアップ） → [Save ＆ GitHub送信 (一括)]\r\n\r\n" +
-                "※抽出されたVBAコードを格納する src フォルダは、誤編集防止のため自動的に「隠しフォルダ」として保護されます。\r\n\r\n" +
+                "※初めて Save するときだけ、「記録者の登録」画面が表示されます（お名前を1度登録すれば次回から不要です）。\r\n" +
+                "※抽出されたVBAコードを格納する src フォルダは、誤編集防止のため自動的に「隠しフォルダ」として保護されます。\r\n" +
+                "※Save のたびに、binフォルダ内のExcelブック本体が backup フォルダへコピーされます（最新10回分）。\r\n" +
+                "   シートの内容まで昔の状態を取り出したいときに使います（詳しくは「3. やり直し・復元方法」）。\r\n\r\n" +
                 "------------------------------------------------------------\r\n" +
                 "【別のPCで作業を引き継ぐ時（GitHub利用時）】\r\n\r\n" +
                 "1. 必ずExcelブックを閉じた状態にする\r\n" +
@@ -1817,7 +2264,7 @@ namespace VbaGitTool
                 "※重要：復元系の操作を行う際は、必ず事前にExcelブックを閉じてください。\r\n" +
                 "（開いたままだと安全装置が働き、警告ポップアップで自動停止します）\r\n\r\n" +
                 "※復元・Pullの実行前に、現在の src と bin の内容が\r\n" +
-                "  「.git\\vbagit_backup\\日時」へ自動退避されます（直近10回分を保持）。\r\n" +
+                "  「backup\\restore_日時」へ自動退避されます（直近10回分を保持）。\r\n" +
                 "  万一おかしくなった場合は、そこから手動で戻せます。\r\n\r\n" +
                 "■ パターンA：昨日や先週など、特定の履歴・タグ時点に戻したい（最も使う復元）\r\n" +
                 "  1.「過去の履歴・タグ一覧」から戻りたい行をクリックして選択します。\r\n" +
@@ -1827,6 +2274,13 @@ namespace VbaGitTool
                 "■ パターンB：さっきSaveした直前の状態にすぐ戻したい\r\n" +
                 "  → [直前のSave状態へ戻す (ローカル)] を押します。\r\n" +
                 "     最後に Save した時点のコードがExcelブックへ書き戻されます。\r\n\r\n" +
+                "■ パターンC：シートの内容（データ・書式）を昔の状態に戻したい\r\n" +
+                "  上記の復元で戻るのは「VBAコード」だけで、シートの内容は今のままです。\r\n" +
+                "  シートの内容は、Save のたびに作られるブックのコピーから取り出します。\r\n" +
+                "  1. 画面右下の [バックアップフォルダを開く] を押します。\r\n" +
+                "  2.「save_日時_コミットID」フォルダの中のブックを開きます。\r\n" +
+                "     （日時・コミットIDは「過去の履歴」一覧の行と見比べられます。最新10回分を保持）\r\n" +
+                "  3. 必要なシートやセルを、今のブックへコピーして貼り付けます。\r\n\r\n" +
                 "■ バージョンタグ（v1.0 など）を付けるタイミングと使い方\r\n" +
                 "  日々の細かいSaveではなく、「v1.0完成！」「他部署への配布版」「大改修の直前」など、\r\n" +
                 "  後からすぐに見つけ出したい重要な節目（マイルストーン）に「しおり」として使います。\r\n" +
@@ -1839,7 +2293,8 @@ namespace VbaGitTool
             return
                 "【各ボタンの機能と安全装置について】\r\n\r\n" +
                 "・Save (ローカル保存のみ)\r\n" +
-                "  bin内のExcelからVBAコードを抽出し、手元のPC（ローカルGit）に履歴を記録します。\r\n\r\n" +
+                "  bin内のExcelからVBAコードを抽出し、手元のPC（ローカルGit）に履歴を記録します。\r\n" +
+                "  記録と同時に、Excelブック本体を backup フォルダへコピーします。\r\n\r\n" +
                 "・Save ＆ GitHub送信 (一括) / GitHub送信のみ (Push)\r\n" +
                 "  ローカルの履歴や後から付けたタグをGitHubへバックアップ送信します。\r\n\r\n" +
                 "・選択した履歴へ復元 (ローカル) / 直前のSave状態へ戻す (ローカル)\r\n" +
@@ -1848,10 +2303,13 @@ namespace VbaGitTool
                 "  GitHub上の最新変更や過去履歴を取得してExcelへ反映します。\r\n\r\n" +
                 "・選択履歴にタグ付与\r\n" +
                 "  完成版や配布版など、重要な節目の履歴に「v1.0」等の目印（タグ）を付けます。\r\n\r\n" +
+                "・バックアップフォルダを開く\r\n" +
+                "  Save時のブック本体のコピー（save_～）と、復元・Pull前の退避（restore_～）を保存した\r\n" +
+                "  backup フォルダを開きます。それぞれ最新10回分を保持します。\r\n\r\n" +
                 "・親フォルダ自動補正 ＆ srcフォルダ隠し属性保護\r\n" +
                 "  bin フォルダ内で起動しても1階層上の親フォルダを自動認識し、src フォルダは隠し属性で保護します。\r\n\r\n" +
                 "・Excel使用中警告 ＆ 自動退避（安全装置）\r\n" +
-                "  Excelが開いたままの復元を防止し、実行直前に .git\\vbagit_backup へ自動バックアップします。";
+                "  Excelが開いたままの復元を防止し、実行直前に backup フォルダへ自動バックアップします。";
         }
     }
 }
