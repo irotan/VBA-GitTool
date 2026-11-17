@@ -1,5 +1,6 @@
 // VBA Git 管理ツール 最終完成版 (srcフォルダ自動隠し属性対応・ローカル管理特化版)　2026年11月17日 更新
 // 追加: コミットメモ確認＋日時付与 / 記録者(user.name・email)の初回登録 / Save時のブック世代バックアップ(backupフォルダ)
+// 変更: ブックのバックアップは backup 直下に「ブック名_月.日_時分.拡張子」で保存（Saveの日時＝コミットメモ末尾の日時）
 // ビルド例 (C# 5 互換 / .NET Framework 4.x):
 //   csc /target:winexe /out:VbaGitTool.exe VbaGitTool.cs /r:System.Windows.Forms.dll /r:System.Drawing.dll
 
@@ -7,6 +8,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -261,8 +263,11 @@ namespace VbaGitTool
         public static readonly string[] DefaultIgnoreLines = { "bin/*", "!bin/.gitkeep", "~$*", "backup/" };
 
         public const string BackupFolderName = "backup";
-        private const string SavePrefix = "save_";         // Save時のブック本体コピー
         private const string RestorePrefix = "restore_";   // 復元・Pull直前の src/bin 退避
+
+        // ブックのバックアップ名の末尾につける日時スタンプ（例: _01.06_0902 = 1月6日 9時02分）
+        private static readonly Regex StampRegex = new Regex(@"_\d{2}\.\d{2}_\d{4}$", RegexOptions.Compiled);
+        private static readonly Regex BackupNameRegex = new Regex(@"^(?<base>.+)_\d{2}\.\d{2}_\d{4}(?<ext>\.[^.]+)$", RegexOptions.Compiled);
         private const int KeepSaveBackups = 10;
         private const int KeepRestoreBackups = 10;
         public const long BackupWarnBytes = 1024L * 1024L * 1024L;   // 合計1GBで警告
@@ -353,21 +358,24 @@ namespace VbaGitTool
             try
             {
                 string readme = Path.Combine(root, "README.txt");
-                if (File.Exists(readme)) return;
+                if (File.Exists(readme) && File.ReadAllText(readme, Encoding.UTF8).Contains("[README v2]")) return;
 
                 string text =
                     "このフォルダは「VBA Git 管理ツール」が自動で作るバックアップ置き場です。\r\n" +
                     "（Gitの履歴には含まれません。フォルダごと別の場所へコピーしても構いません）\r\n\r\n" +
-                    "■ save_日時_コミットID\r\n" +
+                    "■ ブック名_月.日_時分.xlsm など（例: 給油集計表_11.16_0902.xlsm）\r\n" +
                     "  「Save」を実行するたびに作られる、Excelブック本体のコピーです（シートの内容も含みます）。\r\n" +
+                    "  名前の末尾は Save した日時です（11.16 = 11月16日、0902 = 9時02分）。\r\n" +
                     "  Gitの履歴にはVBAコードしか記録されないため、シートのデータや書式を\r\n" +
                     "  昔の状態に戻したいときに使います。\r\n" +
-                    "  使い方: フォルダ内のブックを開き、必要なシートやセルを今のブックへコピーしてください。\r\n" +
-                    "  日時とコミットIDは、ツールの「過去の履歴」一覧の行と見比べられます。\r\n" +
-                    "  最新10回分だけ保持されます（古いものは自動で削除されます）。\r\n\r\n" +
-                    "■ restore_日時\r\n" +
+                    "  使い方: 戻りたい日時のブックを開き、必要なシートやセルを今のブックへコピーしてください。\r\n" +
+                    "  ツールの「過去の履歴」一覧にあるコミットメモ末尾の日時（例: 2026/11/16 09:02）と見比べられます。\r\n" +
+                    "  ブックごとに最新10回分だけ保持されます（古いものは自動で削除されます）。\r\n" +
+                    "  ※このフォルダのブックは、直接開いて上書き保存せず、別の場所へコピーしてから開いてください。\r\n\r\n" +
+                    "■ restore_日時 フォルダ\r\n" +
                     "  「復元」「Pull」を実行する直前の、src フォルダと bin フォルダの退避です。\r\n" +
-                    "  操作をやり直したいときに使います。最新10回分だけ保持されます。\r\n";
+                    "  操作をやり直したいときに使います。最新10回分だけ保持されます。\r\n\r\n" +
+                    "[README v2]\r\n";
                 File.WriteAllText(readme, text, new UTF8Encoding(true));
             }
             catch { }
@@ -441,50 +449,98 @@ namespace VbaGitTool
         }
 
         /// <summary>
-        /// Save でコミットが作られたとき、bin 内のExcelブック本体を backup\save_日時_コミットID へコピーする。
-        /// 戻り値: コピー先パス / 対象ブックなしなら "" / 失敗なら null
+        /// バックアップ用のファイル名を作る。
+        /// 元の名前の末尾に既に「_月.日_時分」があれば取り除き、新しい日時を付け直す。
+        /// 例: 給油集計表（2026年度）.xlsm → 給油集計表（2026年度）_01.06_0902.xlsm
         /// </summary>
-        public static string BackupWorkbooks(string dir, string shortHash, Action<string> log)
+        public static string MakeBackupFileName(string sourceFileName, DateTime t)
+        {
+            string baseName = Path.GetFileNameWithoutExtension(sourceFileName);
+            string ext = Path.GetExtension(sourceFileName);
+            string stripped = StampRegex.Replace(baseName, "");
+            if (stripped.Length == 0) stripped = baseName;
+            return stripped + "_" + t.ToString("MM'.'dd'_'HHmm", CultureInfo.InvariantCulture) + ext;
+        }
+
+        /// <summary>
+        /// backup 直下の「ブック名_月.日_時分.拡張子」を、ブックごとに最新 keep 件だけ残して削除する。
+        /// 新旧の判定は名前の日付（年がない）ではなく、コピーを作った時刻で行う。
+        /// 対象外（README.txt、フォルダ、名前の形式が違うファイル）には触らない。
+        /// </summary>
+        private static void PruneWorkbookBackups(string root, int keep)
+        {
+            try
+            {
+                var groups = new Dictionary<string, List<FileInfo>>(StringComparer.OrdinalIgnoreCase);
+                foreach (string f in Directory.GetFiles(root))
+                {
+                    Match m = BackupNameRegex.Match(Path.GetFileName(f));
+                    if (!m.Success || !IsWorkbook(f)) continue;
+
+                    string key = m.Groups["base"].Value + m.Groups["ext"].Value;
+                    List<FileInfo> list;
+                    if (!groups.TryGetValue(key, out list))
+                    {
+                        list = new List<FileInfo>();
+                        groups[key] = list;
+                    }
+                    list.Add(new FileInfo(f));
+                }
+
+                foreach (var kv in groups)
+                {
+                    foreach (FileInfo fi in kv.Value
+                        .OrderByDescending(x => x.CreationTime)
+                        .ThenByDescending(x => x.LastWriteTime)
+                        .Skip(keep))
+                    {
+                        try { fi.Delete(); } catch { }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Save でコミットが作られたとき、bin 内のExcelブック本体を backup 直下へ
+        /// 「ブック名_月.日_時分.拡張子」の名前でコピーする。
+        /// 戻り値: コピーしたファイルのパス一覧 / 対象ブックなしなら空配列 / 失敗なら null
+        /// </summary>
+        public static string[] BackupWorkbooks(string dir, DateTime saveTime, Action<string> log)
         {
             try
             {
                 string bin = Path.Combine(dir, "bin");
-                if (!Directory.Exists(bin)) return "";
+                if (!Directory.Exists(bin)) return new string[0];
 
                 string[] files = Directory.GetFiles(bin).Where(f => IsWorkbook(f)).ToArray();
-                if (files.Length == 0) return "";
+                if (files.Length == 0) return new string[0];
 
                 string root = GetBackupRoot(dir);
                 Directory.CreateDirectory(root);
                 EnsureBackupReadme(root);
 
-                string name = SavePrefix + DateTime.Now.ToString("yyyyMMdd_HHmmss")
-                    + (string.IsNullOrEmpty(shortHash) ? "" : "_" + shortHash);
-                string dest = Path.Combine(root, name);
-                Directory.CreateDirectory(dest);
-
-                int failed = 0;
+                var created = new List<string>();
                 foreach (string f in files)
                 {
+                    string dest = Path.Combine(root, MakeBackupFileName(Path.GetFileName(f), saveTime));
                     try
                     {
-                        File.Copy(f, Path.Combine(dest, Path.GetFileName(f)), true);
+                        // 同じ分に再Saveした場合は上書き（作り直して、作成時刻も新しくする）
+                        if (File.Exists(dest)) File.Delete(dest);
+                        File.Copy(f, dest, false);
+                        created.Add(dest);
                     }
                     catch (Exception ex)
                     {
-                        failed++;
                         if (log != null) log("[警告] ブックのコピーに失敗しました: " + Path.GetFileName(f) + " (" + ex.Message + ")");
                     }
                 }
 
-                if (failed == files.Length)
-                {
-                    try { Directory.Delete(dest, true); } catch { }
-                    return null;
-                }
+                if (created.Count == 0) return null;
 
-                PruneBackups(root, SavePrefix, KeepSaveBackups);
-                return dest;
+                PruneWorkbookBackups(root, KeepSaveBackups);
+                return created.ToArray();
             }
             catch (Exception ex)
             {
@@ -1239,29 +1295,29 @@ namespace VbaGitTool
             return true;
         }
 
-        /// <summary>Save でコミットが作られた直後に、bin内のExcelブック本体を backup\save_日時_コミットID へコピーする。</summary>
-        private async Task BackupWorkbooksAfterCommitAsync(string dir)
+        /// <summary>Save でコミットが作られた直後に、bin内のExcelブック本体を backup 直下へ「ブック名_月.日_時分」でコピーする。</summary>
+        private async Task BackupWorkbooksAfterCommitAsync(string dir, DateTime saveTime)
         {
-            var h = await _cmd.GitAsync(dir, true, "rev-parse", "--short", "HEAD");
-            string hash = h.Success ? h.Output.Trim() : "";
-            if (!Validation.IsValidCommitHash(hash)) hash = "";
-
-            string path = await Task.Run(() => ProjectFiles.BackupWorkbooks(dir, hash, AppendLog));
-            if (path == null)
+            string[] created = await Task.Run(() => ProjectFiles.BackupWorkbooks(dir, saveTime, AppendLog));
+            if (created == null)
             {
                 AppendLog("[警告] ブックのバックアップに失敗しました（Save 自体は成功しています）。");
                 return;
             }
-            if (path.Length == 0) return;
+            if (created.Length == 0) return;
 
-            AppendLog("・ブック本体をバックアップしました: " + path);
+            AppendLog("・ブック本体を backup フォルダへバックアップしました:");
+            foreach (string p in created)
+            {
+                AppendLog("    " + Path.GetFileName(p));
+            }
 
             long size = await Task.Run(() => ProjectFiles.GetDirectorySize(ProjectFiles.GetBackupRoot(dir)));
             if (size > ProjectFiles.BackupWarnBytes)
             {
                 AppendLog(string.Format("[警告] backup フォルダの合計が約 {0} MB になりました。ブックのサイズが大きいため、容量を多く使っています。",
                     size / 1024 / 1024));
-                AppendLog("  不要な古いフォルダは「バックアップフォルダを開く」から手動で削除してください。");
+                AppendLog("  不要な古いファイルは「バックアップフォルダを開く」から手動で削除してください。");
             }
         }
 
@@ -1494,7 +1550,8 @@ namespace VbaGitTool
 
             // コミットメモ: 入力があれば「メモ (日時)」、空欄なら「作業セーブ (日時)」
             string userMemo = Validation.SanitizeMessage(txtCommitMsg.Text);
-            string stamp = DateTime.Now.ToString("yyyy/MM/dd HH:mm");
+            DateTime saveTime = DateTime.Now;   // コミットメモとバックアップ名で同じ日時を使う
+            string stamp = saveTime.ToString("yyyy/MM/dd HH:mm", CultureInfo.InvariantCulture);
             string msg = userMemo.Length > 0
                 ? userMemo + " (" + stamp + ")"
                 : "作業セーブ (" + stamp + ")";
@@ -1539,7 +1596,7 @@ namespace VbaGitTool
                 txtCommitMsg.Clear();
 
                 // コミットが作られたときだけ、ブック本体をバックアップ
-                await BackupWorkbooksAfterCommitAsync(dir);
+                await BackupWorkbooksAfterCommitAsync(dir, saveTime);
             }
             else
             {
@@ -2229,7 +2286,8 @@ namespace VbaGitTool
                 "   ・GitHubにも送る（バックアップ） → [Save ＆ GitHub送信 (一括)]\r\n\r\n" +
                 "※初めて Save するときだけ、「記録者の登録」画面が表示されます（お名前を1度登録すれば次回から不要です）。\r\n" +
                 "※抽出されたVBAコードを格納する src フォルダは、誤編集防止のため自動的に「隠しフォルダ」として保護されます。\r\n" +
-                "※Save のたびに、binフォルダ内のExcelブック本体が backup フォルダへコピーされます（最新10回分）。\r\n" +
+                "※Save のたびに、binフォルダ内のExcelブック本体が backup フォルダへコピーされます。\r\n" +
+                "   名前の末尾に Save の日時が付きます（例: 給油集計表_11.16_0902.xlsm ＝ 11月16日 9:02）。\r\n" +
                 "   シートの内容まで昔の状態を取り出したいときに使います（詳しくは「3. やり直し・復元方法」）。\r\n\r\n" +
                 "------------------------------------------------------------\r\n" +
                 "【別のPCで作業を引き継ぐ時（GitHub利用時）】\r\n\r\n" +
@@ -2277,10 +2335,15 @@ namespace VbaGitTool
                 "■ パターンC：シートの内容（データ・書式）を昔の状態に戻したい\r\n" +
                 "  上記の復元で戻るのは「VBAコード」だけで、シートの内容は今のままです。\r\n" +
                 "  シートの内容は、Save のたびに作られるブックのコピーから取り出します。\r\n" +
-                "  1. 画面右下の [バックアップフォルダを開く] を押します。\r\n" +
-                "  2.「save_日時_コミットID」フォルダの中のブックを開きます。\r\n" +
-                "     （日時・コミットIDは「過去の履歴」一覧の行と見比べられます。最新10回分を保持）\r\n" +
-                "  3. 必要なシートやセルを、今のブックへコピーして貼り付けます。\r\n\r\n" +
+                "  1. [バックアップフォルダを開く] を押します（実行ログ欄の右上にあります）。\r\n" +
+                "  2.「ブック名_月.日_時分」の名前で保存されたブックから、戻りたい日時のものを開きます。\r\n" +
+                "     （例: 給油集計表_11.16_0902.xlsm は、11月16日 9:02 に Save したときのブックです。\r\n" +
+                "      「過去の履歴」一覧のメモ末尾の日時 (2026/11/16 09:02) と見比べられます。\r\n" +
+                "      ブックごとに最新10回分を保持します）\r\n" +
+                "  3. 必要なシートやセルを、今のブックへコピーして貼り付けます。\r\n" +
+                "  ※backup内のブックは、直接開いて上書き保存せず、コピーしてから開いてください。\r\n" +
+                "  ※取り出したブックを bin に入れて使う場合、名前の末尾の「_月.日_時分」は残したままで構いません\r\n" +
+                "    （次の Save のときに、新しい日時へ自動で付け替えられます）。\r\n\r\n" +
                 "■ バージョンタグ（v1.0 など）を付けるタイミングと使い方\r\n" +
                 "  日々の細かいSaveではなく、「v1.0完成！」「他部署への配布版」「大改修の直前」など、\r\n" +
                 "  後からすぐに見つけ出したい重要な節目（マイルストーン）に「しおり」として使います。\r\n" +
@@ -2304,8 +2367,9 @@ namespace VbaGitTool
                 "・選択履歴にタグ付与\r\n" +
                 "  完成版や配布版など、重要な節目の履歴に「v1.0」等の目印（タグ）を付けます。\r\n\r\n" +
                 "・バックアップフォルダを開く\r\n" +
-                "  Save時のブック本体のコピー（save_～）と、復元・Pull前の退避（restore_～）を保存した\r\n" +
-                "  backup フォルダを開きます。それぞれ最新10回分を保持します。\r\n\r\n" +
+                "  Save時のブック本体のコピー（ブック名_月.日_時分.xlsm など）と、復元・Pull前の退避\r\n" +
+                "  （restore_日時 フォルダ）を保存した backup フォルダを開きます。\r\n" +
+                "  ブック本体はブックごとに最新10回分、退避は最新10回分を保持します。\r\n\r\n" +
                 "・親フォルダ自動補正 ＆ srcフォルダ隠し属性保護\r\n" +
                 "  bin フォルダ内で起動しても1階層上の親フォルダを自動認識し、src フォルダは隠し属性で保護します。\r\n\r\n" +
                 "・Excel使用中警告 ＆ 自動退避（安全装置）\r\n" +
