@@ -18,11 +18,14 @@ if not exist "%CSC_PATH%" (
     exit /b 1
 )
 
-:: 読み込むファイルを VbaGitTool.cs に変更
+:: 読み込むファイルを VbaGitTool.cs に設定
 "%CSC_PATH%" /target:winexe /out:VbaGitTool.exe /utf8output VbaGitTool.cs
 if %errorlevel% neq 0 (
     echo.
-    echo [エラー] コンパイルに失敗しました。上記のエラーメッセージを確認してください。
+    echo [エラー] コンパイルに失敗しました。
+    echo ※ VbaGitTool.exe が起動したままだと、上書きできずに失敗します。
+    echo ※ もしツールが開いている場合は、一度閉じてからもう一度実行してください。
+    echo.
     popd
     pause
     exit /b 1
