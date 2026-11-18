@@ -2,6 +2,7 @@
 // 追加: コミットメモ確認＋日時付与 / 記録者(user.name・email)の初回登録 / Save時のブック世代バックアップ(backupフォルダ)
 // 変更: ブックのバックアップは backup 直下に「ブック名_月.日_時分.拡張子」で保存（Saveの日時＝コミットメモ末尾の日時）
 // 第1段: Save前のExcel保存確認 / 履歴に変更モジュールを表示
+// 第2段: タグの強化（日本語の文で付与・一覧に★表示・タグだけ表示・空欄でOKして削除） / 古いコードの一部を取り出す手順をヘルプに追記
 // ビルド例 (C# 5 互換 / .NET Framework 4.x):
 //   csc /target:winexe /out:VbaGitTool.exe VbaGitTool.cs /r:System.Windows.Forms.dll /r:System.Drawing.dll
 
@@ -866,6 +867,7 @@ namespace VbaGitTool
         private TextBox txtLog;
         private HelpForm _helpForm;
         private Label lblHistNote;      // 履歴一覧の使い方の説明
+        private CheckBox chkTagOnly; // タグを付けた履歴だけを表示
         private Label lblHistDetail;    // 選択した履歴で変わったモジュール
         private ToolTip _tip;
 
@@ -874,6 +876,7 @@ namespace VbaGitTool
             public string Hash;
             public string Display;
             public string Detail;
+            public List<TagEntry> Tags;
             public override string ToString() { return Display; }
         }
 
@@ -1015,6 +1018,9 @@ namespace VbaGitTool
                 TextAlign = ContentAlignment.MiddleLeft
             };
             _tip.SetToolTip(lblHistNote, lblHistNote.Text);
+            chkTagOnly = new CheckBox { Text = "タグだけ表示", AutoSize = false, TextAlign = ContentAlignment.MiddleLeft };
+            chkTagOnly.CheckedChanged += async (s, e) => await RunOperationAsync(() => Task.FromResult(0));
+            _tip.SetToolTip(chkTagOnly, "タグを付けた履歴だけを、古いものも含めてすべて表示します。");
 
             btnRefreshHist = CreateStyledButton("履歴再読込", BgBlue, FgBlue, false);
             btnRefreshHist.Click += async (s, e) => await RunOperationAsync(() => RefreshHistoryListAsync());
@@ -1038,7 +1044,7 @@ namespace VbaGitTool
             btnAddTag = CreateStyledButton("選択履歴にタグ付与", BgWhite, FgBlack, false);
             btnAddTag.Click += async (s, e) => await RunOperationAsync(() => ExecuteTagSelectedAsync());
 
-            grpRestore.Controls.AddRange(new Control[] { lblHist, lblHistNote, btnRefreshHist, lstHistory, lblHistDetail, btnRestoreLocal, btnRestoreLatest, btnPull, btnRestoreGithub, btnAddTag });
+            grpRestore.Controls.AddRange(new Control[] { lblHist, lblHistNote, chkTagOnly, btnRefreshHist, lstHistory, lblHistDetail, btnRestoreLocal, btnRestoreLatest, btnPull, btnRestoreGithub, btnAddTag });
 
             // Group 3: 新規構築・初期設定・メンテナンス
             grpSetup = new GroupBox { Text = "3. 新規構築・初期設定・メンテナンス" };
@@ -1162,7 +1168,10 @@ namespace VbaGitTool
             // 一覧の見出しの右側の空きに、使い方の説明を置く（幅が足りなければ2行に折り返す）
             int lblHistW = TextRenderer.MeasureText(lblHist.Text, lblHist.Font).Width;
             int noteX = innerPad + lblHistW + 14;
-            int noteW = btnRefreshHist.Left - 12 - noteX;
+            int chkW = TextRenderer.MeasureText(chkTagOnly.Text, chkTagOnly.Font).Width + 30;
+            int chkH = fh + 6;
+            chkTagOnly.Bounds = new Rectangle(btnRefreshHist.Left - 10 - chkW, rHeaderY + (hdrH - chkH) / 2, chkW, chkH);
+            int noteW = chkTagOnly.Left - 12 - noteX;
             lblHistNote.Visible = noteW >= 120;
             lblHistNote.Bounds = new Rectangle(noteX, rHeaderY, Math.Max(noteW, 0), hdrH);
 
@@ -1377,6 +1386,7 @@ namespace VbaGitTool
             btnRestoreLatest.Enabled = isGitRepo;
             btnRestoreLocal.Enabled = isGitRepo;
             btnAddTag.Enabled = isGitRepo;
+            chkTagOnly.Enabled = isGitRepo;
             btnRefreshHist.Enabled = isGitRepo;
             btnInitProject.Enabled = isGitRepo;
             btnOpenBackup.Enabled = isGitRepo;
@@ -1528,11 +1538,30 @@ namespace VbaGitTool
             }
         }
 
-        private async Task<bool> IsValidTagNameAsync(string dir, string tag)
+        private const int MaxTagLength = 100;
+
+        /// <summary>
+        /// タグの内部名（Gitのタグ名）を作る。日本語の文はタグの説明として保存し、名前は安全な半角文字（tag_日時）にする。
+        /// </summary>
+        private async Task<string> NewTagNameAsync(string dir)
         {
-            if (string.IsNullOrWhiteSpace(tag) || tag.StartsWith("-")) return false;
-            var r = await _cmd.GitAsync(dir, true, "check-ref-format", "refs/tags/" + tag);
-            return r.Success;
+            string baseName = "tag_" + DateTime.Now.ToString("yyyyMMdd_HHmmss", CultureInfo.InvariantCulture);
+            string name = baseName;
+            for (int i = 2; i < 100; i++)
+            {
+                var r = await _cmd.GitAsync(dir, true, "show-ref", "--verify", "-q", "refs/tags/" + name);
+                if (!r.Success) return name;   // 存在しない = 使える
+                name = baseName + "_" + i;
+            }
+            return name;
+        }
+
+        /// <summary>指定の履歴にタグを付ける（内部では注釈付きタグ）。</summary>
+        private async Task<bool> CreateTagAsync(string dir, string rev, string text)
+        {
+            string name = await NewTagNameAsync(dir);
+            var res = await _cmd.GitAsync(dir, false, "tag", "-a", name, rev, "-m", text);
+            return res.Success;
         }
 
         private async Task<bool> HasStagedChangesAsync(string dir)
@@ -1728,10 +1757,12 @@ namespace VbaGitTool
                 AppendLog("・.gitignore に backup/ を追加しました（ブックのバックアップを履歴に入れないため）。");
             }
 
-            string tag = txtTagName.Text.Trim();
-            if (tag.Length > 0 && !await IsValidTagNameAsync(dir, tag))
+            string tagText = Validation.SanitizeMessage(txtTagName.Text);
+            if (tagText.Length > MaxTagLength)
             {
-                MessageBox.Show("タグ名として使用できない文字が含まれています。\n（空白、~ ^ : ? * [ \\ などは使用できません）", "タグ名エラー", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("タグの文が長すぎます（" + MaxTagLength + "文字以内）。\n短くまとめてから、もう一度 Save してください。",
+                    "タグの入力エラー", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                txtTagName.Focus();
                 return;
             }
 
@@ -1813,17 +1844,20 @@ namespace VbaGitTool
                 AppendLog("[案内] 前回セーブからコードの変更点がないため、新規コミットはスキップされました（ブックのバックアップも作成しません）。");
             }
 
-            if (tag.Length > 0)
+            if (tagText.Length > 0)
             {
                 if (!await EnsureGitIdentityAsync(dir))
                 {
-                    AppendLog("[案内] 記録者が登録されなかったため、タグは作成しませんでした。");
+                    AppendLog("[案内] 記録者が登録されなかったため、タグは付けませんでした。");
+                }
+                else if (await CreateTagAsync(dir, "HEAD", tagText))
+                {
+                    AppendLog("・タグを付けました: ★ " + tagText);
+                    txtTagName.Clear();
                 }
                 else
                 {
-                    var tagRes = await _cmd.GitAsync(dir, false, "tag", "-a", tag, "-m", msg);
-                    if (tagRes.Success) txtTagName.Clear();
-                    else AppendLog("[エラー] タグの作成に失敗しました（同名タグが既に存在する可能性があります）。");
+                    AppendLog("[エラー] タグを付けられませんでした。");
                 }
             }
 
@@ -2001,41 +2035,114 @@ namespace VbaGitTool
             }
         }
 
+        /// <summary>
+        /// 選択した履歴のタグを付与する。入力欄を空欄のまま OK したときは、その履歴のタグを削除する。
+        /// </summary>
         private async Task ExecuteTagSelectedAsync()
         {
             string dir = _targetDir;
             var item = GetSelectedHistory();
             if (item == null)
             {
-                MessageBox.Show("タグを付けたい履歴を一覧から選択してください。", "選択エラー", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show("タグを付けたい（または削除したい）履歴を、一覧から選択してください。", "選択エラー", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
             string commitHash = item.Hash;
+            List<TagEntry> current = item.Tags ?? new List<TagEntry>();
 
-            string tagName = PromptInput("バージョンタグの付与", string.Format("選択履歴 [{0}] に付けるタグ名を入力してください\n（完成版や配布時の目印として使います。例: v1.0）:", commitHash), "v1.0");
-            if (string.IsNullOrWhiteSpace(tagName)) return;
-            tagName = tagName.Trim();
+            string currentText = current.Count > 0
+                ? "\n現在のタグ: " + string.Join(" / ", current.Select(t => "★ " + t.Label).ToArray())
+                : "";
 
-            if (!await IsValidTagNameAsync(dir, tagName))
+            string input = PromptInput("タグの付与・削除",
+                string.Format("選択した履歴 [{0}] に付けるタグの文を入力してください。\n（動作確認ができた節目や、大きな変更の前の目印として使います）\n例: 月次集計の完成 / 関数の整理前{1}\n\n※タグを削除したいときは、空欄のまま [OK] を押してください。", commitHash, currentText),
+                "");
+            if (input == null) return;   // キャンセル
+
+            string text = Validation.SanitizeMessage(input);
+            if (text.Length == 0)
             {
-                MessageBox.Show("タグ名として使用できない文字が含まれています。\n（空白、~ ^ : ? * [ \\ などは使用できません）", "タグ名エラー", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                await DeleteTagsOfHistoryAsync(dir, item);
                 return;
             }
 
-            string tagMsg = PromptInput("タグのメモ", "タグの説明メモを入力してください:", "リリース版");
-            tagMsg = string.IsNullOrWhiteSpace(tagMsg) ? tagName : Validation.SanitizeMessage(tagMsg);
+            if (text.Length > MaxTagLength)
+            {
+                MessageBox.Show("タグの文が長すぎます（" + MaxTagLength + "文字以内）。", "タグの入力エラー", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
 
             if (!await EnsureGitIdentityAsync(dir))
             {
-                AppendLog("[案内] 記録者が登録されなかったため、タグは付与しませんでした。");
+                AppendLog("[案内] 記録者が登録されなかったため、タグは付けませんでした。");
                 return;
             }
 
-            var res = await _cmd.GitAsync(dir, false, "tag", "-a", tagName, commitHash, "-m", tagMsg);
-            if (res.Success)
-                AppendLog(string.Format("完了: [{0}] にタグ '{1}' を付与しました。（GitHubへ送るには「GitHub送信のみ」を押してください）", commitHash, tagName));
+            if (await CreateTagAsync(dir, commitHash, text))
+                AppendLog(string.Format("完了: [{0}] にタグを付けました: ★ {1}（GitHubへ送るには「GitHub送信のみ」を押してください）", commitHash, text));
             else
-                AppendLog("[エラー] タグの付与に失敗しました（同名タグが既に存在する可能性があります）。");
+                AppendLog("[エラー] タグを付けられませんでした。");
+        }
+
+        /// <summary>選択した履歴に付いているタグを、確認のうえ削除する（GitHubへ送信済みのタグはGitHub側からも削除する）。</summary>
+        private async Task DeleteTagsOfHistoryAsync(string dir, HistoryItem item)
+        {
+            List<TagEntry> tags = item.Tags ?? new List<TagEntry>();
+            if (tags.Count == 0)
+            {
+                MessageBox.Show("この履歴にはタグが付いていないため、削除するものがありません。\n\nタグを付けるときは、文を入力してから [OK] を押してください。",
+                    "タグがありません", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            string list = string.Join("\n", tags.Select(t => "　★ " + t.Label).ToArray());
+            string remoteNote = _hasRemote ? "\nGitHubへ送信済みのタグは、GitHub側からも削除します。" : "";
+            var answer = MessageBox.Show(
+                "選択した履歴 [" + item.Hash + "] の、次のタグを削除します。\n\n" + list + "\n\n" +
+                "※履歴（VBAコードの記録）は消えません。目印のタグだけが外れます。" + remoteNote + "\n\n" +
+                "よろしいですか？",
+                "タグの削除の確認", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
+            if (answer != DialogResult.Yes)
+            {
+                AppendLog("[案内] タグの削除を中止しました。");
+                return;
+            }
+
+            foreach (TagEntry t in tags)
+            {
+                if (_hasRemote)
+                {
+                    // GitHub側にも同じタグがあるか確認する（残したままだと、「GitHub取得」で再び表示されるため）
+                    var ls = await _cmd.GitAsync(dir, true, "ls-remote", "--tags", "origin", "refs/tags/" + t.Name);
+                    if (!ls.Success)
+                    {
+                        var localOnly = MessageBox.Show(
+                            "GitHub側にタグがあるか確認できませんでした（通信や認証のエラーの可能性があります）。\n\n" +
+                            "「" + t.Label + "」を、このPCからだけ削除しますか？\n\n" +
+                            "※GitHub側にタグが残っている場合、「GitHub取得後に復元」などで、また表示されることがあります。",
+                            "GitHubを確認できません", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+                        if (localOnly != DialogResult.Yes)
+                        {
+                            AppendLog("[案内] タグ「" + t.Label + "」の削除を中止しました。");
+                            continue;
+                        }
+                    }
+                    else if (!string.IsNullOrWhiteSpace(ls.Output))
+                    {
+                        var del = await _cmd.GitAsync(dir, false, "push", "origin", "--delete", "refs/tags/" + t.Name);
+                        if (!del.Success)
+                        {
+                            AppendLog("[エラー] GitHub側のタグを削除できませんでした: " + t.Label + "（このPCのタグも残しています）");
+                            continue;
+                        }
+                        AppendLog("・GitHub側のタグを削除しました: " + t.Label);
+                    }
+                }
+
+                var rm = await _cmd.GitAsync(dir, false, "tag", "-d", t.Name);
+                if (rm.Success) AppendLog("完了: タグを削除しました: ★ " + t.Label);
+                else AppendLog("[エラー] タグを削除できませんでした: " + t.Label);
+            }
         }
 
         // ---------------------------------------------------------------------
@@ -2311,13 +2418,38 @@ namespace VbaGitTool
             }
         }
 
+        /// <summary>1つのタグ（Git上の名前と、一覧に表示する文）。</summary>
+        private class TagEntry
+        {
+            public string Name;
+            public string Label;
+        }
+
         private async Task RefreshHistoryListAsync()
         {
             lstHistory.Items.Clear();
+            string dir = _targetDir;
+            bool tagOnly = chkTagOnly.Checked;
 
-            // 変更ファイル一覧つきで取得する。各履歴の先頭に区切り(0x1e)を付けて分割する。
-            var res = await _cmd.GitAsync(_targetDir, true, "log", "-n", "30", "--date=short", "--no-renames", "--name-status",
-                "--pretty=format:%x1e%h%x1f%ad%x1f%d%x1f%s%x1f%p");
+            // 履歴(完全なID) → その履歴に付いているタグの一覧
+            Dictionary<string, List<TagEntry>> tagMap = await GetTagMapAsync(dir);
+
+            var args = new List<string> { "log" };
+            if (tagOnly)
+            {
+                // タグが付いた履歴だけを、件数制限なしで古いものまで全部
+                args.Add("--no-walk=sorted");
+                args.Add("--tags");
+            }
+            else
+            {
+                args.Add("-n");
+                args.Add("30");
+            }
+            args.AddRange(new[] { "--date=short", "--no-renames", "--name-status",
+                "--pretty=format:%x1e%h%x1f%ad%x1f%d%x1f%s%x1f%p%x1f%H" });
+
+            var res = await _cmd.GitAsync(dir, true, args.ToArray());
             if (res.Success && !string.IsNullOrWhiteSpace(res.Output))
             {
                 string[] records = res.Output.Split(new[] { '\u001e' }, StringSplitOptions.RemoveEmptyEntries);
@@ -2325,7 +2457,7 @@ namespace VbaGitTool
                 {
                     string[] lines = rec.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
                     string[] p = lines[0].Split('\u001f');
-                    if (p.Length < 5 || !Validation.IsValidCommitHash(p[0])) continue;
+                    if (p.Length < 6 || !Validation.IsValidCommitHash(p[0])) continue;
 
                     bool isRoot = p[4].Trim().Length == 0;   // 親がない = 最初の記録
                     var statusLines = new List<string>();
@@ -2337,12 +2469,88 @@ namespace VbaGitTool
                     string shortText, detail;
                     BuildChangeInfo(statusLines, isRoot, out shortText, out detail);
 
-                    string deco = p[2].Trim();
-                    string display = p[0] + "  " + p[1] + "  " + (deco.Length > 0 ? deco + " " : "") + p[3] + "  " + shortText;
-                    lstHistory.Items.Add(new HistoryItem { Hash = p[0], Display = display, Detail = detail });
+                    // タグ: 「★ 文」で表示する（Git上のタグ名そのものは一覧に出さない）
+                    List<TagEntry> entries;
+                    tagMap.TryGetValue(p[5].Trim(), out entries);
+                    if (entries == null) entries = new List<TagEntry>();
+
+                    string marks = "";
+                    if (entries.Count > 0)
+                    {
+                        string[] labels = entries.Select(t => t.Label).ToArray();
+                        marks = string.Join(" ", labels.Select(l => "★ " + l).ToArray()) + "  ";
+                        detail = "タグ: " + string.Join(" / ", labels) + "　｜　" + detail;
+                    }
+
+                    string deco = FilterDecoration(p[2]);
+                    string display = p[0] + "  " + p[1] + "  " + marks + (deco.Length > 0 ? deco + " " : "") + p[3] + "  " + shortText;
+                    lstHistory.Items.Add(new HistoryItem { Hash = p[0], Display = display, Detail = detail, Tags = entries });
                 }
             }
             UpdateHistoryDetail();
+        }
+
+        /// <summary>
+        /// 全タグを調べて「履歴(完全なID) → その履歴に付いているタグ」の対応表を作る。
+        /// 本ツールで付けたタグ(tag_～)は日本語の文を、以前からあるタグ(v1.0など)は「メモ（タグ名）」または名前を表示する。
+        /// </summary>
+        private async Task<Dictionary<string, List<TagEntry>>> GetTagMapAsync(string dir)
+        {
+            var map = new Dictionary<string, List<TagEntry>>(StringComparer.OrdinalIgnoreCase);
+            var r = await _cmd.GitAsync(dir, true, "for-each-ref", "refs/tags",
+                "--format=%(refname:short)%1f%(objecttype)%1f%(objectname)%1f%(*objectname)%1f%(contents:subject)");
+            if (!r.Success || string.IsNullOrWhiteSpace(r.Output)) return map;
+
+            foreach (string line in r.Output.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string[] f = line.Split('\u001f');
+                if (f.Length < 5) continue;
+
+                string name = f[0].Trim();
+                string type = f[1].Trim();        // tag = 注釈付き / commit = 軽量
+                string obj = f[2].Trim();
+                string peeled = f[3].Trim();      // 注釈付きタグが指す履歴
+                string subject = f[4].Trim();
+
+                string commit = (type == "tag") ? peeled : obj;
+                if (commit.Length == 0) continue;
+
+                string label;
+                if (type == "tag" && subject.Length > 0 && subject != name)
+                {
+                    label = IsAutoTagName(name) ? subject : subject + "（" + name + "）";
+                }
+                else
+                {
+                    label = name;
+                }
+
+                List<TagEntry> list;
+                if (!map.TryGetValue(commit, out list))
+                {
+                    list = new List<TagEntry>();
+                    map[commit] = list;
+                }
+                list.Add(new TagEntry { Name = name, Label = label });
+            }
+            return map;
+        }
+
+        /// <summary>本ツールが自動で付けたタグ名か（tag_日時。以前の版の shiori_日時 も含む）。</summary>
+        private static bool IsAutoTagName(string name)
+        {
+            return name.StartsWith("tag_", StringComparison.Ordinal) || name.StartsWith("shiori_", StringComparison.Ordinal);
+        }
+
+        /// <summary>git log の「(HEAD -> main, tag: v1.0, origin/main)」から、タグの部分を除く（タグは★で別に表示するため）。</summary>
+        private static string FilterDecoration(string raw)
+        {
+            string t = (raw ?? "").Trim();
+            if (t.Length < 2 || t[0] != '(' || t[t.Length - 1] != ')') return t;
+
+            string[] items = t.Substring(1, t.Length - 2).Split(new[] { ", " }, StringSplitOptions.RemoveEmptyEntries);
+            string[] keep = items.Where(x => !x.StartsWith("tag: ", StringComparison.Ordinal)).ToArray();
+            return keep.Length == 0 ? "" : "(" + string.Join(", ", keep) + ")";
         }
 
         /// <summary>git log --name-status の行から、src 配下のモジュール単位の変更内容を作る。</summary>
@@ -2402,9 +2610,10 @@ namespace VbaGitTool
         private void UpdateHistoryDetail()
         {
             var it = lstHistory.SelectedItem as HistoryItem;
-            string text = it == null
-                ? "履歴の行を選ぶと、変更されたモジュール名がここに表示されます。"
-                : it.Detail;
+            string text;
+            if (it != null) text = it.Detail;
+            else if (lstHistory.Items.Count == 0 && chkTagOnly.Checked) text = "タグを付けた履歴はまだありません。";
+            else text = "履歴の行を選ぶと、変更されたモジュール名がここに表示されます。";
             lblHistDetail.Text = text;
             _tip.SetToolTip(lblHistDetail, text);
         }
@@ -2567,7 +2776,9 @@ namespace VbaGitTool
                 f.Font = this.Font;
                 int fh = this.Font.Height;
                 f.Text = title;
-                f.ClientSize = new Size(Math.Max(540, fh * 30), Math.Max(195, fh * 11));
+                int pw = Math.Max(540, fh * 30);
+                int promptH = TextRenderer.MeasureText(prompt, f.Font, new Size(pw - 28, int.MaxValue), TextFormatFlags.WordBreak).Height;
+                f.ClientSize = new Size(pw, Math.Max(Math.Max(195, fh * 11), promptH + fh * 6 + 24));
                 f.StartPosition = FormStartPosition.CenterParent;
                 f.FormBorderStyle = FormBorderStyle.FixedDialog;
                 f.MaximizeBox = false;
@@ -2670,6 +2881,7 @@ namespace VbaGitTool
                 "4. タイミングに合わせてボタンを押す\r\n" +
                 "   ・PC内だけ（ローカル）に保存 → [Save (ローカル保存のみ)]\r\n" +
                 "   ・GitHubにも送る（バックアップ） → [Save ＆ GitHub送信 (一括)]\r\n\r\n" +
+                "※節目のSaveには、「タグ(任意)」欄に一言入れておくと、あとで探しやすくなります（例: 月次集計の完成）。\r\n" +
                 "※初めて Save するときだけ、「記録者の登録」画面が表示されます（お名前を1度登録すれば次回から不要です）。\r\n" +
                 "※Excelに保存していない変更が残っているときは、Save の前に「保存してから Save しますか？」と確認が出ます。\r\n" +
                 "※抽出されたVBAコードを格納する src フォルダは、誤編集防止のため自動的に「隠しフォルダ」として保護されます。\r\n" +
@@ -2712,7 +2924,7 @@ namespace VbaGitTool
                 "  「backup\\restore_日時」へ自動退避されます（直近10回分を保持）。\r\n" +
                 "  万一おかしくなった場合は、そこから手動で戻せます。\r\n\r\n" +
                 "■ パターンA：昨日や先週など、特定の履歴・タグ時点に戻したい（最も使う復元）\r\n" +
-                "  1.「過去の履歴・タグ一覧」から戻りたい行をクリックして選択します。\r\n" +
+                "  1.「過去の履歴一覧」から戻りたい行をクリックして選択します（タグを付けた行は「★ 文」と表示されます）。\r\n" +
                 "     （行を選ぶと、一覧の下に「そのSaveで変わったモジュール」が表示されます。\r\n" +
                 "      行末の〔3件〕は、変更されたモジュールの数です）\r\n" +
                 "  2. [選択した履歴へ復元 (ローカル)] を押します（GitHub上の履歴を使う場合は [GitHub取得後]）。\r\n" +
@@ -2733,11 +2945,33 @@ namespace VbaGitTool
                 "  ※backup内のブックは、直接開いて上書き保存せず、コピーしてから開いてください。\r\n" +
                 "  ※取り出したブックを bin に入れて使う場合、名前の末尾の「_月.日_時分」は残したままで構いません\r\n" +
                 "    （次の Save のときに、新しい日時へ自動で付け替えられます）。\r\n\r\n" +
-                "■ バージョンタグ（v1.0 など）を付けるタイミングと使い方\r\n" +
-                "  日々の細かいSaveではなく、「v1.0完成！」「他部署への配布版」「大改修の直前」など、\r\n" +
-                "  後からすぐに見つけ出したい重要な節目（マイルストーン）に「しおり」として使います。\r\n" +
-                "  ・履歴一覧から行を選択して [選択履歴にタグ付与] を押し、タグ名を入力します。\r\n" +
-                "  ・その後 [GitHub送信のみ (Push)] を押すとGitHub上にもタグが反映されます。";
+                "■ タグ（目印）を付けるタイミングと使い方\r\n" +
+                "  日々の細かいSaveではなく、「月次集計の完成」「他部署への配布版」「大きな変更の前」など、\r\n" +
+                "  後からすぐに見つけたい節目に、目印として付けます。文章は日本語で自由に書けます。\r\n" +
+                "  （GitやGitHubでも「タグ」という同じ名前の機能です。GitHub上では「Tags」に表示されます）\r\n" +
+                "  ・Save のときに「タグ(任意)」欄へ入力すると、そのSaveに付きます。\r\n" +
+                "  ・後から付けるときは、履歴一覧から行を選び [選択履歴にタグ付与] を押して、文を入力します。\r\n" +
+                "  ・タグを付けた履歴は、一覧で「★ 文」と表示されます。\r\n" +
+                "  ・一覧の [タグだけ表示] にチェックすると、タグを付けた履歴だけを、古いものも含めて全部表示します。\r\n" +
+                "  ・[GitHub送信のみ (Push)] を押すと、GitHub上にもタグが反映されます。\r\n\r\n" +
+                "■ タグを削除したい時\r\n" +
+                "  1. 履歴一覧から、タグを削除したい行を選びます。\r\n" +
+                "  2. [選択履歴にタグ付与] を押し、表示された入力欄を「空欄のまま」[OK] を押します。\r\n" +
+                "  3. 削除するタグの確認が出るので、よければ [はい] を押します。\r\n" +
+                "  ※削除されるのは目印のタグだけで、履歴（VBAコードの記録）は消えません。\r\n" +
+                "  ※その行に複数のタグが付いているときは、すべて削除されます。\r\n" +
+                "  ※GitHubへ送信済みのタグは、GitHub側からも削除されます（通信できないときは確認が出ます）。\r\n\r\n" +
+                "■ 古いコードの一部だけ取り出したい時（「この関数だけ昔のものを使いたい」）\r\n" +
+                "  本ツールには、モジュールだけを部分的に戻す機能はありません。\r\n" +
+                "  （一部だけ古いコードが混ざると、誰も動かしたことのない状態になり、原因が分かりにくくなるためです）\r\n" +
+                "  代わりに、次の手順でVBAエディタからコピーします。\r\n" +
+                "  1. まず、今の状態を [Save] して記録しておきます。\r\n" +
+                "  2. 一覧から欲しいコードがある行を選び、[選択した履歴へ復元 (ローカル)] を押します。\r\n" +
+                "  3. Excelを開き、VBAエディタ（Alt + F11）で、欲しいコードをコピーします。\r\n" +
+                "  4. Excelを閉じてから、[直前のSave状態へ戻す (ローカル)] を押し、元の状態に戻します。\r\n" +
+                "  5. Excelを開いて、コピーしたコードを必要な場所へ貼り付け、動作を確認してから [Save] します。\r\n" +
+                "  ※手順1の Save を忘れると、手順4で戻る先がなくなります\r\n" +
+                "    （その場合も、backup フォルダの restore_日時 に退避が残っています）。";
         }
 
         private string GetReferenceGuideText()
@@ -2753,8 +2987,10 @@ namespace VbaGitTool
                 "  手元のPCに記録された履歴から、指定時点（または直前）のVBAコードをExcelへ書き戻します。\r\n\r\n" +
                 "・Pull / 選択した履歴へ復元 (GitHub取得後)\r\n" +
                 "  GitHub上の最新変更や過去履歴を取得してExcelへ反映します。\r\n\r\n" +
-                "・選択履歴にタグ付与\r\n" +
-                "  完成版や配布版など、重要な節目の履歴に「v1.0」等の目印（タグ）を付けます。\r\n\r\n" +
+                "・選択履歴にタグ付与 / タグだけ表示\r\n" +
+                "  重要な節目の履歴に、日本語の文で目印（タグ）を付けます。一覧では「★ 文」と表示されます。\r\n" +
+                "  [タグだけ表示] にチェックすると、タグを付けた履歴だけを、古いものも含めて全部表示します。\r\n" +
+                "  タグを削除するときは、[選択履歴にタグ付与] を押して、入力欄を空欄のまま [OK] を押します。\r\n\r\n" +
                 "・バックアップフォルダを開く\r\n" +
                 "  Save時のブック本体のコピー（ブック名_月.日_時分.xlsm など）と、復元・Pull前の退避\r\n" +
                 "  （restore_日時 フォルダ）を保存した backup フォルダを開きます。\r\n" +
