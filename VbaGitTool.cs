@@ -960,7 +960,7 @@ namespace VbaGitTool
             this.Font = new Font("Yu Gothic UI", 9.5f, FontStyle.Regular);
 
             int fh = this.Font.Height;
-            int initW = Math.Max(940, fh * 52);
+            int initW = Math.Max(1000, fh * 56);
             int initH = Math.Max(740, fh * 41);
 
             Rectangle workArea = Screen.PrimaryScreen.WorkingArea;
