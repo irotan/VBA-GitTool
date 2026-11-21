@@ -3,6 +3,8 @@
 // 変更: ブックのバックアップは backup 直下に「ブック名_月.日_時分.拡張子」で保存（Saveの日時＝コミットメモ末尾の日時）
 // 第1段: Save前のExcel保存確認 / 履歴に変更モジュールを表示
 // 第2段: タグの強化（日本語の文で付与・一覧に★表示・タグだけ表示・空欄でOKして削除） / 古いコードの一部を取り出す手順をヘルプに追記
+// 第3段: ローカルのリポジトリをGitHubへ初回登録する機能 / GitHub接続先変更 / 「GitHub送信のみ」を廃止 /
+//        「初期設定」を「監視除外設定」へ改名 / グループ3を2段6ボタンに整理（バックアップを開くを移動）
 // ビルド例 (C# 5 互換 / .NET Framework 4.x):
 //   csc /target:winexe /out:VbaGitTool.exe VbaGitTool.cs /r:System.Windows.Forms.dll /r:System.Drawing.dll
 
@@ -62,6 +64,7 @@ namespace VbaGitTool
         public int ExitCode;
         public string Output;   // stdout のみ
         public string Error;    // stderr のみ
+        public bool TimedOut;   // 時間切れで打ち切った
         public bool Success { get { return ExitCode == 0; } }
     }
 
@@ -117,7 +120,21 @@ namespace VbaGitTool
             return RunAsync("git", JoinArgs(all), workDir, silent);
         }
 
+        /// <summary>時間切れつきで git を実行する（認証ウィンドウの放置などで止まらないようにする）。</summary>
+        public Task<CmdResult> GitWithTimeoutAsync(string workDir, bool silent, int timeoutMs, params string[] args)
+        {
+            var all = new List<string> { "-c", "core.quotepath=false" };
+            all.AddRange(args);
+            return RunAsync("git", JoinArgs(all), workDir, silent, timeoutMs);
+        }
+
         public Task<CmdResult> RunAsync(string fileName, string arguments, string workDir, bool silent)
+        {
+            return RunAsync(fileName, arguments, workDir, silent, 0);
+        }
+
+        /// <summary>timeoutMs が 0 より大きいとき、その時間を過ぎたら、子プロセスごと終了する。</summary>
+        public Task<CmdResult> RunAsync(string fileName, string arguments, string workDir, bool silent, int timeoutMs)
         {
             return Task.Run(() =>
             {
@@ -162,6 +179,17 @@ namespace VbaGitTool
                         proc.Start();
                         proc.BeginOutputReadLine();
                         proc.BeginErrorReadLine();
+
+                        if (timeoutMs > 0 && !proc.WaitForExit(timeoutMs))
+                        {
+                            // 時間切れ: 認証ウィンドウの放置などで止まっているので、子プロセスごと終了する
+                            KillTree(proc);
+                            try { proc.WaitForExit(3000); } catch { }
+                            lock (gate)
+                            {
+                                return new CmdResult { ExitCode = -2, TimedOut = true, Output = sbOut.ToString(), Error = sbErr.ToString() };
+                            }
+                        }
                         proc.WaitForExit();
 
                         lock (gate)
@@ -176,6 +204,26 @@ namespace VbaGitTool
                     return new CmdResult { ExitCode = -1, Output = "", Error = ex.Message };
                 }
             });
+        }
+
+        private static void KillTree(Process proc)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "taskkill",
+                    Arguments = "/PID " + proc.Id + " /T /F",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                using (Process k = Process.Start(psi))
+                {
+                    if (k != null) k.WaitForExit(5000);
+                }
+            }
+            catch { }
+            try { if (!proc.HasExited) proc.Kill(); } catch { }
         }
     }
 
@@ -833,6 +881,7 @@ namespace VbaGitTool
         private bool _gitAvailable = true;
         private string _branch;
         private bool _hasRemote;
+        private string _remoteUrl;
 
         // UI
         private Panel pnlTop;
@@ -846,7 +895,8 @@ namespace VbaGitTool
         private TextBox txtTagName;
         private Button btnSave;
         private Button btnSaveAndPush;
-        private Button btnPushOnly;
+        private Button btnConnectGitHub;   // GitHubに接続 (初回登録)
+        private Button btnChangeRemote;    // GitHub接続先変更
         private Button btnPull;
         private Button btnRestoreLatest;
         private ListBox lstHistory;
@@ -961,7 +1011,9 @@ namespace VbaGitTool
 
             int fh = this.Font.Height;
             int initW = Math.Max(1000, fh * 56);
-            int initH = Math.Max(740, fh * 41);
+            float dpiY;
+	　　using (Graphics gScr = Graphics.FromHwnd(IntPtr.Zero)) { dpiY = gScr.DpiY; }
+	　　int initH = Math.Max(780, fh * 43) - (int)(dpiY / 2.54f * 2.0f);   // 2.0f が「2cm」。この数字で調整できます
 
             Rectangle workArea = Screen.PrimaryScreen.WorkingArea;
             if (initW > workArea.Width - 20) initW = workArea.Width - 20;
@@ -969,7 +1021,7 @@ namespace VbaGitTool
 
             this.Text = "VBA Git 管理ツール";
             this.ClientSize = new Size(initW, initH);
-            this.MinimumSize = new Size(Math.Min(860, initW), Math.Min(680, initH));
+            this.MinimumSize = new Size(Math.Min(860, initW), Math.Min(720, initH));
             this.StartPosition = FormStartPosition.CenterScreen;
 
             // 上部ヘッダー
@@ -1000,10 +1052,7 @@ namespace VbaGitTool
             btnSaveAndPush = CreateStyledButton("Save ＆ GitHub送信 (一括)", BgWhite, FgBlack, false);
             btnSaveAndPush.Click += async (s, e) => await RunOperationAsync(() => ExecuteSaveAsync(true));
 
-            btnPushOnly = CreateStyledButton("GitHub送信のみ (Push)", BgWhite, FgBlack, false);
-            btnPushOnly.Click += async (s, e) => await RunOperationAsync(() => ExecutePushOnlyAsync());
-
-            grpSave.Controls.AddRange(new Control[] { lblMsg, txtCommitMsg, lblTag, txtTagName, btnSave, btnSaveAndPush, btnPushOnly });
+            grpSave.Controls.AddRange(new Control[] { lblMsg, txtCommitMsg, lblTag, txtTagName, btnSave, btnSaveAndPush });
 
             // Group 2: 取得・復元（やり直し）
             grpRestore = new GroupBox { Text = "2. 取得・復元（やり直し） ※Excelを閉じてから実行" };
@@ -1055,16 +1104,28 @@ namespace VbaGitTool
             btnCloneNew = CreateStyledButton("新規クローン (GitHubから)", BgWhite, FgBlack, false);
             btnCloneNew.Click += async (s, e) => await RunOperationAsync(() => ExecuteCloneNewAsync());
 
-            btnInitProject = CreateStyledButton("初期設定 (.gitignore / 監視解除)", BgWhite, FgBlack, false);
-            btnInitProject.Click += async (s, e) => await RunOperationAsync(() => OpenInitProjectDialogAsync());
+            btnConnectGitHub = CreateStyledButton("GitHubに接続 (初回登録)", BgWhite, FgBlack, false);
+            btnConnectGitHub.Click += async (s, e) => await RunOperationAsync(() => ExecuteConnectGitHubAsync());
 
-            grpSetup.Controls.AddRange(new Control[] { btnInitLocalNew, btnCloneNew, btnInitProject });
+            btnInitProject = CreateStyledButton("監視除外設定 (.gitignore)", BgWhite, FgBlack, false);
+            btnInitProject.Click += async (s, e) => await RunOperationAsync(() => OpenGitignoreDialogAsync());
+
+            btnChangeRemote = CreateStyledButton("GitHub接続先変更", BgWhite, FgBlack, false);
+            btnChangeRemote.Click += async (s, e) => await RunOperationAsync(() => ExecuteChangeRemoteAsync());
+
+            // 実行ログの行から、このグループへ移動（VBAコードの保存先 src と取り違えないよう、題名で区別する）
+            btnOpenBackup = CreateStyledButton("Excelブックのバックアップを開く", BgBlue, FgBlue, false);
+            btnOpenBackup.Click += (s, e) => OpenBackupFolder();
+
+            _tip.SetToolTip(btnConnectGitHub, "手元で作った履歴を、GitHubへ初めて送信します。\nGitHub側は、README・.gitignore・ライセンスを追加しない「空のリポジトリ」で作ってください。");
+            _tip.SetToolTip(btnChangeRemote, "GitHubの接続先（URL）を、別のリポジトリへ変更します。\n（リポジトリ名を変えたとき、別のアカウントや組織へ移したときなど）");
+            _tip.SetToolTip(btnInitProject, "Gitの管理から外すファイルの設定（.gitignore）を、あとから追加・変更します。");
+            _tip.SetToolTip(btnOpenBackup, "Saveのたびに作られる、Excelブック本体のコピー（backupフォルダ）を開きます。\nVBAコードの保存先（srcフォルダ）ではありません。");
+
+            grpSetup.Controls.AddRange(new Control[] { btnInitLocalNew, btnConnectGitHub, btnCloneNew, btnInitProject, btnChangeRemote, btnOpenBackup });
 
             // 4. 実行ログ
             lblLog = new Label { Text = "実行ログ:", AutoSize = true };
-
-            btnOpenBackup = CreateStyledButton("バックアップフォルダを開く", BgBlue, FgBlue, false);
-            btnOpenBackup.Click += (s, e) => OpenBackupFolder();
 
             btnToggleReg = CreateStyledButton("右クリックメニュー登録済み (解除する)", BgWhite, FgBlack, false);
             btnToggleReg.Click += (s, e) => ToggleContextMenuRegistration();
@@ -1079,8 +1140,34 @@ namespace VbaGitTool
                 Font = new Font("Consolas", 9.5f)
             };
 
-            this.Controls.AddRange(new Control[] { pnlTop, grpSave, grpRestore, grpSetup, lblLog, btnOpenBackup, btnToggleReg, txtLog });
+            this.Controls.AddRange(new Control[] { pnlTop, grpSave, grpRestore, grpSetup, lblLog, btnToggleReg, txtLog });
+            EnsureWidthForButtonLabels();
             ApplyResponsiveLayout();
+        }
+
+        /// <summary>
+        /// 起動時にボタンの文字が切れないよう、必要な幅を計算して、画面の幅と最小幅に反映する。
+        /// （グループ1は2列、グループ3は3列。いちばん長い文字に合わせる）
+        /// </summary>
+        private void EnsureWidthForButtonLabels()
+        {
+            int gap = 10, pad = 12, innerPad = 14;
+            int w1 = Math.Max(MeasureButtonWidth(btnSave, 28), MeasureButtonWidth(btnSaveAndPush, 28));
+            int w3 = new[] { btnInitLocalNew, btnConnectGitHub, btnCloneNew, btnInitProject, btnChangeRemote, btnOpenBackup }
+                .Max(b => MeasureButtonWidth(b, 28));
+            int need1 = w1 * 2 + gap + innerPad * 2 + pad * 2;
+            int need3 = w3 * 3 + gap * 2 + innerPad * 2 + pad * 2;
+            int needW = Math.Max(need1, need3);
+
+            Rectangle workArea = Screen.PrimaryScreen.WorkingArea;
+            needW = Math.Min(needW, workArea.Width - 20);
+            if (this.ClientSize.Width < needW) this.ClientSize = new Size(needW, this.ClientSize.Height);
+
+            int frameW = this.Width - this.ClientSize.Width;
+            if (this.MinimumSize.Width < needW + frameW)
+            {
+                this.MinimumSize = new Size(needW + frameW, this.MinimumSize.Height);
+            }
         }
 
         private void ApplyResponsiveLayout()
@@ -1133,20 +1220,19 @@ namespace VbaGitTool
             txtCommitMsg.Bounds = new Rectangle(msgLeft, grpTopMargin, msgW, txtH);
 
             int saveBtnY = grpTopMargin + txtH + 10;
-            int w3_1 = (innerW - gap * 2) / 3;
-            int w3_2 = (innerW - gap * 2) / 3;
-            int w3_3 = innerW - gap * 2 - w3_1 - w3_2;
+            int saveW1 = (innerW - gap) / 2;
+            int saveW2 = innerW - gap - saveW1;
 
-            btnSave.Bounds = new Rectangle(innerPad, saveBtnY, w3_1, btnH);
-            btnSaveAndPush.Bounds = new Rectangle(btnSave.Right + gap, saveBtnY, w3_2, btnH);
-            btnPushOnly.Bounds = new Rectangle(btnSaveAndPush.Right + gap, saveBtnY, w3_3, btnH);
+            btnSave.Bounds = new Rectangle(innerPad, saveBtnY, saveW1, btnH);
+            btnSaveAndPush.Bounds = new Rectangle(btnSave.Right + gap, saveBtnY, saveW2, btnH);
 
             int grp1H = saveBtnY + btnH + 12;
             grpSave.Bounds = new Rectangle(pad, grp1Y, grpW, grp1H);
 
             // 3. Group 3 (Setup) の高さを確定
             int setupBtnY = fh + 8;
-            int grp3H = setupBtnY + btnH + 12;
+            int setupRowGap = 8;
+            int grp3H = setupBtnY + btnH * 2 + setupRowGap + 12;   // 2段
 
             // 4. 残り高さを Group 2 (Restore) と Log に配分
             int logHeaderH = smallBtnH + 6;
@@ -1203,16 +1289,23 @@ namespace VbaGitTool
             // 5. Group 3 (Setup)
             int grp3Y = grpRestore.Bottom + 8;
             grpSetup.Bounds = new Rectangle(pad, grp3Y, grpW, grp3H);
-            btnInitLocalNew.Bounds = new Rectangle(innerPad, setupBtnY, w3_1, btnH);
-            btnCloneNew.Bounds = new Rectangle(btnInitLocalNew.Right + gap, setupBtnY, w3_2, btnH);
-            btnInitProject.Bounds = new Rectangle(btnCloneNew.Right + gap, setupBtnY, w3_3, btnH);
+
+            // 6ボタンを、2段×3列の同じ幅で並べる
+            int c3w1 = (innerW - gap * 2) / 3;
+            int c3w2 = (innerW - gap * 2) / 3;
+            int c3w3 = innerW - gap * 2 - c3w1 - c3w2;
+            int row2Y = setupBtnY + btnH + setupRowGap;
+            btnInitLocalNew.Bounds = new Rectangle(innerPad, setupBtnY, c3w1, btnH);
+            btnConnectGitHub.Bounds = new Rectangle(btnInitLocalNew.Right + gap, setupBtnY, c3w2, btnH);
+            btnCloneNew.Bounds = new Rectangle(btnConnectGitHub.Right + gap, setupBtnY, c3w3, btnH);
+            btnInitProject.Bounds = new Rectangle(innerPad, row2Y, c3w1, btnH);
+            btnChangeRemote.Bounds = new Rectangle(btnInitProject.Right + gap, row2Y, c3w2, btnH);
+            btnOpenBackup.Bounds = new Rectangle(btnChangeRemote.Right + gap, row2Y, c3w3, btnH);
 
             // 6. 実行ログエリア
             int logHeaderY = grpSetup.Bottom + 8;
             int regW = MeasureButtonWidth(btnToggleReg, 28);
             btnToggleReg.Bounds = new Rectangle(cw - pad - regW, logHeaderY, regW, smallBtnH);
-            int bkW = MeasureButtonWidth(btnOpenBackup, 28);
-            btnOpenBackup.Bounds = new Rectangle(btnToggleReg.Left - 8 - bkW, logHeaderY, bkW, smallBtnH);
             lblLog.Location = new Point(pad + 2, logHeaderY + (smallBtnH - fh) / 2);
 
             int txtLogTop = btnToggleReg.Bottom + 6;
@@ -1349,6 +1442,7 @@ namespace VbaGitTool
                 lblGitInfo.Text = "状態: Git未初期化フォルダ（親フォルダとして「新規作成」「クローン」が可能です）";
                 _branch = null;
                 _hasRemote = false;
+                _remoteUrl = null;
                 SetProjectButtonsEnabled(false, false, false);
                 lstHistory.Items.Clear();
                 return;
@@ -1361,6 +1455,7 @@ namespace VbaGitTool
             var rm = await _cmd.GitAsync(_targetDir, true, "remote", "get-url", "origin");
             string remoteUrl = rm.Success ? rm.Output.Trim() : "";
             _hasRemote = !string.IsNullOrEmpty(remoteUrl);
+            _remoteUrl = remoteUrl;
 
             string branchText = _branch ?? "(detached HEAD)";
             string remoteText = _hasRemote ? remoteUrl : "(リモート未設定・ローカル専用)";
@@ -1392,7 +1487,8 @@ namespace VbaGitTool
             btnOpenBackup.Enabled = isGitRepo;
 
             btnSaveAndPush.Enabled = isGitRepo && canSync;
-            btnPushOnly.Enabled = isGitRepo && canSync;
+            btnConnectGitHub.Enabled = isGitRepo && !hasRemote;   // GitHub未接続のときだけ
+            btnChangeRemote.Enabled = isGitRepo && hasRemote;     // GitHub接続済みのときだけ
             btnPull.Enabled = isGitRepo && canSync;
             btnRestoreGithub.Enabled = isGitRepo && hasRemote;
 
@@ -1534,7 +1630,7 @@ namespace VbaGitTool
             {
                 AppendLog(string.Format("[警告] backup フォルダの合計が約 {0} MB になりました。ブックのサイズが大きいため、容量を多く使っています。",
                     size / 1024 / 1024));
-                AppendLog("  不要な古いファイルは「バックアップフォルダを開く」から手動で削除してください。");
+                AppendLog("  不要な古いファイルは「Excelブックのバックアップを開く」から手動で削除してください。");
             }
         }
 
@@ -1740,7 +1836,7 @@ namespace VbaGitTool
             {
                 ProjectFiles.EnsureDefaultGitignore(dir);
                 AppendLog("・.gitignore に標準の除外設定を追加しました。");
-                AppendLog("  ※すでにbin内のファイルをGit登録済みの場合は「初期設定」で監視解除してください。");
+                AppendLog("  ※すでにbin内のファイルをGit登録済みの場合は「監視除外設定」で監視解除してください。");
             }
             return true;
         }
@@ -1874,19 +1970,308 @@ namespace VbaGitTool
             }
         }
 
-        private async Task ExecutePushOnlyAsync()
+        // ---------------------------------------------------------------------
+        // GitHubへの接続（初回登録 / 接続先の変更）
+        // ---------------------------------------------------------------------
+        private const int NetworkTimeoutMs = 120000;   // 認証ウィンドウの放置などで止まらないよう、2分で打ち切る
+
+        private const string EmptyRepoGuide =
+            "GitHubでリポジトリを作るときは、「Add a README file」「Add .gitignore」「Choose a license」を\n" +
+            "すべてオフ（追加しない）にして、空のリポジトリを作ってください。";
+
+        private async Task RemoveOriginAsync(string dir)
+        {
+            await _cmd.GitAsync(dir, true, "remote", "remove", "origin");
+        }
+
+        private async Task RestoreOriginAsync(string dir, string oldUrl)
+        {
+            await _cmd.GitAsync(dir, true, "remote", "set-url", "origin", oldUrl);
+        }
+
+        private void ShowNetworkTimeout()
+        {
+            AppendLog("[エラー] 2分たっても応答がなかったため、中止しました。");
+            MessageBox.Show(
+                "2分たっても応答がなかったため、中止しました。\n\n" +
+                "サインイン用のウィンドウが開いている場合は、サインインを完了するか、閉じてから、もう一度お試しください。",
+                "応答がありません", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        private void ShowConnectFailed(string url)
+        {
+            AppendLog("[エラー] GitHubに接続できませんでした。");
+            MessageBox.Show(
+                "GitHubに接続できませんでした。次の点を確認してください。\n\n" +
+                "・URLが正しいか（GitHubの「Code」ボタンからコピーしたものか）\n" +
+                "・GitHubにサインインできているか（初回は、サインイン用のウィンドウやブラウザが開きます）\n" +
+                "・インターネットに接続できているか\n\n" +
+                "サインインがうまくいかない場合は、コマンドプロンプトなどで次のコマンドを1度だけ実行して、\n" +
+                "サインインを済ませてから、もう一度お試しください。\n\n" +
+                "git ls-remote " + url,
+                "GitHubに接続できません", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        /// <summary>
+        /// ローカルで作ったリポジトリを、GitHubへ初めて登録（接続して最初の送信）する。
+        /// GitHub側にブランチが1つでもあれば（READMEなどが作られていれば）「空ではない」と判定して、何も変更せずに止める。
+        /// </summary>
+        private async Task ExecuteConnectGitHubAsync()
         {
             string dir = _targetDir;
-            if (!_hasRemote || _branch == null)
+
+            if (_hasRemote)
             {
-                AppendLog("[エラー] リモート未設定、またはブランチ上にいないため送信できません。");
+                MessageBox.Show("すでにGitHubへ接続されています。\n\n現在の接続先:\n" + _remoteUrl + "\n\n接続先を変えるときは、「GitHub接続先変更」を使ってください。",
+                    "接続済み", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            if (_branch == null)
+            {
+                MessageBox.Show("ブランチ上にいない状態（detached HEAD）のため、接続できません。", "接続できません", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
-            AppendLog("========== GitHub 送信 (Push) ==========");
-            var res = await _cmd.GitAsync(dir, false, "push", "-u", "origin", _branch, "--follow-tags");
-            if (res.Success) AppendLog("完了: GitHub へのバックアップ送信が完了しました！");
-            else AppendLog("[エラー] GitHub への送信に失敗しました。認証・ネットワーク・リモート設定を確認してください。");
+            var head = await _cmd.GitAsync(dir, true, "rev-parse", "--verify", "-q", "HEAD");
+            if (!head.Success)
+            {
+                MessageBox.Show("まだ履歴がありません。\n先に [Save] を実行して、最初の履歴を作ってから、もう一度お試しください。",
+                    "履歴がありません", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            var cnt = await _cmd.GitAsync(dir, true, "rev-list", "--count", "HEAD");
+            string count = cnt.Success ? cnt.Output.Trim() : "?";
+
+            string url = PromptInput("GitHubに接続 (初回登録)",
+                "手元で作った履歴を、GitHubへ初めて送信します。\n" +
+                "GitHubのリポジトリURLを貼り付けてください。\n" +
+                "（GitHubの「Code」ボタンからコピーできます。例: https://github.com/ユーザー名/リポジトリ名.git）\n\n" +
+                "【手元で作った履歴をGitHubへ上げる場合】\n" +
+                EmptyRepoGuide + "\n" +
+                "（GitHubから始める「新規クローン」のときは、READMEなどがあってもかまいません）",
+                "");
+            if (string.IsNullOrWhiteSpace(url)) return;
+            url = url.Trim();
+
+            if (!Validation.IsSafeCloneUrl(url))
+            {
+                MessageBox.Show("URLの形式が正しくありません。\n（空白・制御文字・先頭の「-」は使用できません）", "エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            var confirm = MessageBox.Show(
+                "現在のブランチ「" + _branch + "」の履歴（" + count + "件）を、次のGitHubリポジトリへ送信します。\n\n" +
+                "　" + url + "\n\n" +
+                "【確認してください】\n" +
+                "・手元で作った履歴をGitHubへ上げる場合、GitHub側は、README・.gitignore・ライセンスを追加していない空のリポジトリであること\n" +
+                "　（追加していると、送信できません）\n" +
+                "・リポジトリが「Public（公開）」の場合、履歴と記録者の名前が、誰でも見られる状態になります\n" +
+                "・会社のコードを外部サービスへ送ってよいか、社内のルールを確認してください\n" +
+                "・サインイン用のウィンドウやブラウザが開くことがあります（2分以内に完了してください）\n\n" +
+                "送信してよろしいですか？",
+                "GitHubへの初回登録の確認", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
+            if (confirm != DialogResult.Yes)
+            {
+                AppendLog("[案内] GitHubへの接続を中止しました。");
+                return;
+            }
+
+            AppendLog("========== GitHubに接続 (初回登録) ==========");
+            var addRes = await _cmd.GitAsync(dir, false, "remote", "add", "origin", url);
+            if (!addRes.Success)
+            {
+                AppendLog("[エラー] 接続先を登録できませんでした。");
+                return;
+            }
+
+            // 1) GitHub側が空か確認する（READMEなどが1つでもあれば、ブランチがあるので「空ではない」）
+            var ls = await _cmd.GitWithTimeoutAsync(dir, false, NetworkTimeoutMs, "ls-remote", "--heads", "origin");
+            if (ls.TimedOut)
+            {
+                await RemoveOriginAsync(dir);
+                ShowNetworkTimeout();
+                return;
+            }
+            if (!ls.Success)
+            {
+                await RemoveOriginAsync(dir);
+                ShowConnectFailed(url);
+                return;
+            }
+            if (!string.IsNullOrWhiteSpace(ls.Output))
+            {
+                await RemoveOriginAsync(dir);
+                AppendLog("[案内] GitHub側のリポジトリが空ではないため、接続を中止しました（何も変更していません）。");
+                MessageBox.Show(
+                    "GitHub側のリポジトリが空ではありません（READMEなどが、すでに作られています）。\n\n" +
+                    "手元の履歴とGitHub側の履歴は、別々に始まったものなので、このまま合わせることはできません。\n" +
+                    "何も変更せずに、接続を中止しました。\n\n" +
+                    "【対処】\n" +
+                    EmptyRepoGuide + "\n" +
+                    "作り直してから、もう一度お試しください。\n\n" +
+                    "※手元で作った履歴をGitHubへ上げる場合は、GitHub側を空にします。\n" +
+                    "　（GitHubから始める「新規クローン」のときは、READMEなどがあってもかまいません）",
+                    "GitHub側が空ではありません", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            // 2) 最初の送信（タグも一緒に送る）
+            AppendLog(string.Format("> GitHub へ送信中 (git push -u origin {0} --follow-tags)...", _branch));
+            var push = await _cmd.GitWithTimeoutAsync(dir, false, NetworkTimeoutMs, "push", "-u", "origin", _branch, "--follow-tags");
+            if (push.TimedOut)
+            {
+                ShowNetworkTimeout();
+                AppendLog("  接続先は登録したままです。[Save ＆ GitHub送信 (一括)] で、もう一度送信できます。");
+                return;
+            }
+            if (!push.Success)
+            {
+                AppendLog("[エラー] GitHub への送信に失敗しました。接続先は登録したままです。");
+                AppendLog("  認証・ネットワークを確認して、[Save ＆ GitHub送信 (一括)] で、もう一度送信してください。");
+                return;
+            }
+
+            AppendLog("完了: GitHubに接続し、履歴を送信しました！ 以降は [Save ＆ GitHub送信 (一括)] で、記録と送信を一度に行えます。");
+        }
+
+        /// <summary>
+        /// GitHubの接続先（origin）を、別のリポジトリへ変更する。
+        /// 新しい接続先が「空」、または「今の履歴の続き（先頭が手元の履歴に含まれる）」のときだけ進め、
+        /// それ以外は何も変更せずに止める。失敗したときは、元の接続先へ戻す。
+        /// </summary>
+        private async Task ExecuteChangeRemoteAsync()
+        {
+            string dir = _targetDir;
+
+            if (!_hasRemote)
+            {
+                MessageBox.Show("GitHubに接続されていません。\n先に「GitHubに接続 (初回登録)」を使ってください。", "未接続", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            if (_branch == null)
+            {
+                MessageBox.Show("ブランチ上にいない状態（detached HEAD）のため、変更できません。", "変更できません", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            string oldUrl = _remoteUrl;
+
+            string url = PromptInput("GitHub接続先変更",
+                "現在の接続先:\n" + oldUrl + "\n\n" +
+                "新しい接続先のURLを貼り付けてください。\n" +
+                "（リポジトリの名前を変えたとき、別のアカウントや組織へ移したときなどに使います）\n\n" +
+                "※新しい接続先は、空のリポジトリ（README・.gitignore・ライセンスを追加していないもの）、\n" +
+                "　または、今の履歴の続きが入っているものにしてください。",
+                "");
+            if (string.IsNullOrWhiteSpace(url)) return;
+            url = url.Trim();
+
+            if (!Validation.IsSafeCloneUrl(url))
+            {
+                MessageBox.Show("URLの形式が正しくありません。\n（空白・制御文字・先頭の「-」は使用できません）", "エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            if (string.Equals(url, oldUrl, StringComparison.OrdinalIgnoreCase))
+            {
+                MessageBox.Show("現在の接続先と同じURLです。", "変更なし", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            var confirm = MessageBox.Show(
+                "今後のGitHubへの送信先を、次のように変更します。\n\n" +
+                "　現在: " + oldUrl + "\n" +
+                "　変更後: " + url + "\n\n" +
+                "・変更後の接続先を確認してから、現在のブランチ「" + _branch + "」の履歴を送信します。\n" +
+                "・古い接続先にあるデータは、そのまま残ります。\n" +
+                "・サインイン用のウィンドウやブラウザが開くことがあります（2分以内に完了してください）。\n\n" +
+                "変更してよろしいですか？",
+                "GitHub接続先変更の確認", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
+            if (confirm != DialogResult.Yes)
+            {
+                AppendLog("[案内] 接続先の変更を中止しました。");
+                return;
+            }
+
+            AppendLog("========== GitHub接続先の変更 ==========");
+            var setRes = await _cmd.GitAsync(dir, false, "remote", "set-url", "origin", url);
+            if (!setRes.Success)
+            {
+                AppendLog("[エラー] 接続先を変更できませんでした。");
+                return;
+            }
+
+            // 新しい接続先を確認する
+            var ls = await _cmd.GitWithTimeoutAsync(dir, false, NetworkTimeoutMs, "ls-remote", "--heads", "origin");
+            if (ls.TimedOut)
+            {
+                await RestoreOriginAsync(dir, oldUrl);
+                ShowNetworkTimeout();
+                AppendLog("  元の接続先のままです。");
+                return;
+            }
+            if (!ls.Success)
+            {
+                await RestoreOriginAsync(dir, oldUrl);
+                ShowConnectFailed(url);
+                AppendLog("  元の接続先のままです。");
+                return;
+            }
+
+            bool remoteHasHeads = false;
+            string remoteTip = null;   // 新しい接続先の、現在のブランチの先頭
+            foreach (string line in ls.Output.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string[] p = line.Split('\t');
+                if (p.Length < 2) continue;
+                remoteHasHeads = true;
+                if (p[1].Trim() == "refs/heads/" + _branch) remoteTip = p[0].Trim();
+            }
+
+            if (remoteHasHeads)
+            {
+                // 空ではない: 現在のブランチの先頭が、手元の履歴に含まれている（= 今の履歴の続き）ときだけ進める
+                bool continuation = false;
+                if (remoteTip != null && Validation.IsValidCommitHash(remoteTip))
+                {
+                    var exists = await _cmd.GitAsync(dir, true, "cat-file", "-e", remoteTip + "^{commit}");
+                    if (exists.Success)
+                    {
+                        var anc = await _cmd.GitAsync(dir, true, "merge-base", "--is-ancestor", remoteTip, "HEAD");
+                        continuation = anc.Success;
+                    }
+                }
+
+                if (!continuation)
+                {
+                    await RestoreOriginAsync(dir, oldUrl);
+                    AppendLog("[案内] 新しい接続先に、今の履歴の続きではない内容があるため、変更を中止しました（元の接続先のままです）。");
+                    MessageBox.Show(
+                        "新しい接続先に、今の履歴の続きではない内容が入っています。\n" +
+                        "（別々に始まった履歴、または、手元にない新しい履歴があります）\n\n" +
+                        "何も変更せずに、元の接続先のままにしました。\n\n" +
+                        "【対処】\n" +
+                        "・新しい接続先として、空のリポジトリを作ってください。\n" +
+                        EmptyRepoGuide + "\n" +
+                        "・同じリポジトリの名前変更などで、GitHub側に手元にない新しい履歴がある場合は、\n" +
+                        "　先に [Pull] で取得してから、もう一度お試しください。",
+                        "接続先を変更できません", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+            }
+
+            AppendLog(string.Format("> GitHub へ送信中 (git push -u origin {0} --follow-tags)...", _branch));
+            var push = await _cmd.GitWithTimeoutAsync(dir, false, NetworkTimeoutMs, "push", "-u", "origin", _branch, "--follow-tags");
+            if (push.TimedOut || !push.Success)
+            {
+                await RestoreOriginAsync(dir, oldUrl);
+                if (push.TimedOut) ShowNetworkTimeout();
+                else AppendLog("[エラー] GitHub への送信に失敗しました。");
+                AppendLog("  接続先を、元のURLへ戻しました。");
+                return;
+            }
+
+            AppendLog("完了: GitHubの接続先を変更しました。");
+            AppendLog("  " + oldUrl);
+            AppendLog("  → " + url);
         }
 
         private async Task ExecutePullAsync()
@@ -2079,7 +2464,7 @@ namespace VbaGitTool
             }
 
             if (await CreateTagAsync(dir, commitHash, text))
-                AppendLog(string.Format("完了: [{0}] にタグを付けました: ★ {1}（GitHubへ送るには「GitHub送信のみ」を押してください）", commitHash, text));
+                AppendLog(string.Format("完了: [{0}] にタグを付けました: ★ {1}（GitHubへは、次の「Save ＆ GitHub送信」で一緒に送られます）", commitHash, text));
             else
                 AppendLog("[エラー] タグを付けられませんでした。");
         }
@@ -2146,7 +2531,7 @@ namespace VbaGitTool
         }
 
         // ---------------------------------------------------------------------
-        // 新規作成 / クローン / 初期設定
+        // 新規作成 / クローン / 監視除外設定
         // ---------------------------------------------------------------------
         private async Task ExecuteInitLocalNewAsync()
         {
@@ -2239,7 +2624,7 @@ namespace VbaGitTool
             _targetDir = newProjectPath;
         }
 
-        private async Task OpenInitProjectDialogAsync()
+        private async Task OpenGitignoreDialogAsync()
         {
             string dir = _targetDir;
             string gitignorePath = Path.Combine(dir, ".gitignore");
@@ -2257,7 +2642,7 @@ namespace VbaGitTool
                 dlg.AutoScaleMode = AutoScaleMode.None;
                 dlg.Font = this.Font;
                 int fh = this.Font.Height;
-                dlg.Text = "プロジェクト初期設定（.gitignore 編集 ＆ 監視解除）";
+                dlg.Text = "監視除外設定（.gitignore の編集 ＆ 監視解除）";
                 dlg.ClientSize = new Size(Math.Max(600, fh * 34), Math.Max(460, fh * 26));
                 dlg.MinimumSize = new Size(540, 400);
                 dlg.StartPosition = FormStartPosition.CenterParent;
@@ -2352,7 +2737,7 @@ namespace VbaGitTool
                 deleteTpl = chkDelPushTpl.Checked;
             }
 
-            AppendLog("========== 初期設定・監視解除を実行 ==========");
+            AppendLog("========== 監視除外設定を実行 ==========");
             File.WriteAllText(gitignorePath, newText.TrimEnd() + "\r\n", new UTF8Encoding(false));
 
             // backup/ の除外は常に維持する（ブックのバックアップを履歴に入れないため）
@@ -2410,7 +2795,7 @@ namespace VbaGitTool
             {
                 var push = await _cmd.GitAsync(dir, false, "push", "-u", "origin", branch);
                 if (push.Success) AppendLog("完了: .gitignore の更新と GitHub からの管理除外が完了しました！");
-                else AppendLog("[エラー] GitHub への送信に失敗しました。後で「GitHub送信のみ」を実行してください。");
+                else AppendLog("[エラー] GitHub への送信に失敗しました。後で「Save ＆ GitHub送信」を実行してください。");
             }
             else
             {
@@ -2900,18 +3285,45 @@ namespace VbaGitTool
         {
             return
                 "【新しいVBA案件を始める時のステップ】\r\n\r\n" +
+                "■ スタート地点について（ここが大切です）\r\n" +
+                "  本ツールの基本の流れは、「まず手元のPCにリポジトリを作る → 必要になったらGitHubへ上げる」です。\r\n" +
+                "  何から始めるかで、使うボタンが変わります。\r\n" +
+                "  ・手元（ローカル）から始める …… [新規作成 (ローカル専用)] → 必要なら [GitHubに接続 (初回登録)]\r\n" +
+                "  ・GitHubから始める（GitHub上にあるものを手元に取り込む）…… [新規クローン (GitHubから)]\r\n" +
+                "  違いは「スタート地点が、手元か、GitHubか」だけです。\r\n\r\n" +
                 "■ パターンA：手元のPC内だけで管理する（社外秘・単独開発など、最も一般的な使い方）\r\n" +
                 "  1. 案件のフォルダを作りたい「親フォルダ」で右クリックして本ツールを開く\r\n" +
                 "  2. [新規作成 (ローカル専用)] を押し、フォルダ名を入力する\r\n" +
                 "  3. 新しいフォルダが作成され、自動的に切り替わります\r\n" +
                 "     （標準の .gitignore と bin/.gitkeep も自動作成されます）\r\n" +
-                "  4. 必要なら [初期設定 (.gitignore / 監視解除)] で除外設定を編集します\r\n" +
+                "  4. 必要なら [監視除外設定 (.gitignore)] で除外設定を編集します\r\n" +
                 "  5. 自動作成された bin フォルダにExcelファイルを入れ、[Save] を押せば初期登録完了です！\r\n\r\n" +
-                "■ パターンB：GitHubを利用してバックアップや共有を行う場合\r\n" +
-                "  1. GitHub上で新しい空のリポジトリを作成し、URLをコピーします\r\n" +
-                "  2. 親フォルダで本ツールを開き、[新規クローン (GitHubから)] を押します\r\n" +
-                "  3. コピーしたURLを貼り付けると、フォルダが作成され自動的に切り替わります\r\n" +
-                "  4. 以降はパターンAの 4～5 と同じ手順です。";
+                "■ パターンB：手元で始めたものを、あとからGitHubへ上げる（バックアップや共有をしたくなった時）\r\n" +
+                "  ※「手元のリポジトリが先にあり、それをGitHubへ上げる」場合です。\r\n" +
+                "  1. GitHubで新しいリポジトリを作ります。このとき、次の3つは「すべてオフ（追加しない）」にして、\r\n" +
+                "     必ず空のリポジトリを作ってください。\r\n" +
+                "       ・Add a README file\r\n" +
+                "       ・Add .gitignore\r\n" +
+                "       ・Choose a license\r\n" +
+                "     （これらを追加すると、GitHub側に履歴ができてしまい、手元の履歴と合わせられなくなります。\r\n" +
+                "      READMEが1つあるだけでも「空ではない」と判定され、本ツールは何も変更せずに止めて、\r\n" +
+                "      作り直すよう案内します）\r\n" +
+                "  2. 作成後に表示されるURL（https://github.com/ユーザー名/リポジトリ名.git）をコピーします\r\n" +
+                "  3. 本ツールで対象のフォルダを開き、[GitHubに接続 (初回登録)] を押してURLを貼り付けます\r\n" +
+                "     （先に1回以上 [Save] して、履歴を作っておいてください）\r\n" +
+                "  4. 確認のあと、手元の履歴がGitHubへ送信されます（初回は、サインイン用のウィンドウが開くことがあります）\r\n" +
+                "  5. 以降は、[Save ＆ GitHub送信 (一括)] で、記録とGitHubへの送信を一度に行えます\r\n\r\n" +
+                "■ パターンC：GitHubから始める（すでにGitHub上にあるリポジトリを、手元に取り込む）\r\n" +
+                "  ※「スタート地点がGitHub」の場合です。こちらは、GitHub側にREADMEなどがあってもかまいません。\r\n" +
+                "  1. 親フォルダで本ツールを開き、[新規クローン (GitHubから)] を押します\r\n" +
+                "  2. GitHubの「Code」ボタンからコピーしたURLと、ローカルのフォルダ名を入力します\r\n" +
+                "  3. フォルダが作成され、自動的に切り替わります\r\n" +
+                "  4. 以降はパターンAの 4～5 と同じ手順です。\r\n\r\n" +
+                "■ GitHubの接続先を変えたい時（リポジトリ名の変更・別の組織への移動など）\r\n" +
+                "  [GitHub接続先変更] を押し、新しいURLを貼り付けます。\r\n" +
+                "  ・新しい接続先が、空のリポジトリ、または今の履歴の続きであれば、変更して送信します。\r\n" +
+                "  ・別の履歴が入っている場合は、何も変更せずに止めて案内します。\r\n" +
+                "  ・古い接続先にあるデータは、そのまま残ります。";
         }
 
         private string GetRestoreGuideText()
@@ -2936,7 +3348,7 @@ namespace VbaGitTool
                 "■ パターンC：シートの内容（データ・書式）を昔の状態に戻したい\r\n" +
                 "  上記の復元で戻るのは「VBAコード」だけで、シートの内容は今のままです。\r\n" +
                 "  シートの内容は、Save のたびに作られるブックのコピーから取り出します。\r\n" +
-                "  1. [バックアップフォルダを開く] を押します（実行ログ欄の右上にあります）。\r\n" +
+                "  1. [Excelブックのバックアップを開く] を押します（画面中ほどの「3.」のグループの、右下にあります）。\r\n" +
                 "  2.「ブック名_月.日_時分」の名前で保存されたブックから、戻りたい日時のものを開きます。\r\n" +
                 "     （例: 給油集計表_11.16_0902.xlsm は、11月16日 9:02 に Save したときのブックです。\r\n" +
                 "      「過去の履歴」一覧のメモ末尾の日時 (2026/11/16 09:02) と見比べられます。\r\n" +
@@ -2953,7 +3365,7 @@ namespace VbaGitTool
                 "  ・後から付けるときは、履歴一覧から行を選び [選択履歴にタグ付与] を押して、文を入力します。\r\n" +
                 "  ・タグを付けた履歴は、一覧で「★ 文」と表示されます。\r\n" +
                 "  ・一覧の [タグだけ表示] にチェックすると、タグを付けた履歴だけを、古いものも含めて全部表示します。\r\n" +
-                "  ・[GitHub送信のみ (Push)] を押すと、GitHub上にもタグが反映されます。\r\n\r\n" +
+                "  ・[Save ＆ GitHub送信 (一括)] を押すと、GitHub上にもタグが反映されます。\r\n\r\n" +
                 "■ タグを削除したい時\r\n" +
                 "  1. 履歴一覧から、タグを削除したい行を選びます。\r\n" +
                 "  2. [選択履歴にタグ付与] を押し、表示された入力欄を「空欄のまま」[OK] を押します。\r\n" +
@@ -2981,8 +3393,9 @@ namespace VbaGitTool
                 "・Save (ローカル保存のみ)\r\n" +
                 "  bin内のExcelからVBAコードを抽出し、手元のPC（ローカルGit）に履歴を記録します。\r\n" +
                 "  記録と同時に、Excelブック本体を backup フォルダへコピーします。\r\n\r\n" +
-                "・Save ＆ GitHub送信 (一括) / GitHub送信のみ (Push)\r\n" +
-                "  ローカルの履歴や後から付けたタグをGitHubへバックアップ送信します。\r\n\r\n" +
+                "・Save ＆ GitHub送信 (一括)\r\n" +
+                "  上のSaveに加えて、GitHubへの送信までを一度に行います。記録する変更がないときも、\r\n" +
+                "  後から付けたタグなどを含めて、GitHubへ送信します。\r\n\r\n" +
                 "・選択した履歴へ復元 (ローカル) / 直前のSave状態へ戻す (ローカル)\r\n" +
                 "  手元のPCに記録された履歴から、指定時点（または直前）のVBAコードをExcelへ書き戻します。\r\n\r\n" +
                 "・Pull / 選択した履歴へ復元 (GitHub取得後)\r\n" +
@@ -2991,10 +3404,23 @@ namespace VbaGitTool
                 "  重要な節目の履歴に、日本語の文で目印（タグ）を付けます。一覧では「★ 文」と表示されます。\r\n" +
                 "  [タグだけ表示] にチェックすると、タグを付けた履歴だけを、古いものも含めて全部表示します。\r\n" +
                 "  タグを削除するときは、[選択履歴にタグ付与] を押して、入力欄を空欄のまま [OK] を押します。\r\n\r\n" +
-                "・バックアップフォルダを開く\r\n" +
+                "・Excelブックのバックアップを開く\r\n" +
                 "  Save時のブック本体のコピー（ブック名_月.日_時分.xlsm など）と、復元・Pull前の退避\r\n" +
                 "  （restore_日時 フォルダ）を保存した backup フォルダを開きます。\r\n" +
+                "  ※VBAコードの保存先（src フォルダ）ではありません。\r\n" +
                 "  ブック本体はブックごとに最新10回分、退避は最新10回分を保持します。\r\n\r\n" +
+                "・GitHubに接続 (初回登録)\r\n" +
+                "  手元で作ったリポジトリを、GitHubへ初めて送信します（GitHub未接続のときだけ使えます）。\r\n" +
+                "  GitHubで、README・.gitignore・ライセンスを追加しない「空のリポジトリ」を作り、そのURLを貼り付けます。\r\n" +
+                "  （GitHubから始める [新規クローン] のときは、READMEなどがあってもかまいません）\r\n" +
+                "  GitHub側にREADMEなどがあって空でない場合は、何も変更せずに止めて案内します。\r\n" +
+                "  接続すると、[Save ＆ GitHub送信 (一括)] が使えるようになります。\r\n\r\n" +
+                "・GitHub接続先変更\r\n" +
+                "  GitHubの接続先URLを、別のリポジトリへ変更します（GitHub接続済みのときだけ使えます）。\r\n" +
+                "  新しい接続先が、空のリポジトリ、または今の履歴の続きであるときだけ変更します。\r\n\r\n" +
+                "・監視除外設定 (.gitignore)\r\n" +
+                "  Gitの管理から外すファイルの設定（.gitignore）を、あとから追加・変更します。\r\n" +
+                "  すでに管理対象になっているファイルを、管理から外すこともできます。\r\n\r\n" +
                 "・Save前のExcel保存確認\r\n" +
                 "  Excelに保存していない変更があるとき、Save の前に「保存してから Save しますか？」と確認します。\r\n" +
                 "  Excelがセル入力中などで状態を確認できないときは、その旨を案内します\r\n" +
